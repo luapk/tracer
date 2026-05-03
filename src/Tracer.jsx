@@ -109,7 +109,7 @@ function detectMotion(curr, prev, w, h, threshold, step) {
   return pts;
 }
 
-function detectEdges(gray, w, h, step) {
+function detectEdges(gray, w, h, step, threshold = 80) {
   const pts = [];
   for (let y = step; y < h-step; y += step*2)
     for (let x = step; x < w-step; x += step*2) {
@@ -117,7 +117,7 @@ function detectEdges(gray, w, h, step) {
       const gx = -gray[i-w-1]+gray[i-w+1]-2*gray[i-1]+2*gray[i+1]-gray[i+w-1]+gray[i+w+1];
       const gy = -gray[i-w-1]-2*gray[i-w]-gray[i-w+1]+gray[i+w-1]+2*gray[i+w]+gray[i+w+1];
       const mag = Math.sqrt(gx*gx+gy*gy);
-      if (mag > 80) pts.push({ x, y, intensity: Math.min(mag/300, 1), type: "edge" });
+      if (mag > threshold) pts.push({ x, y, intensity: Math.min(mag/300, 1), type: "edge" });
     }
   return pts;
 }
@@ -373,27 +373,37 @@ function renderN4ture(ctx, points, triangles, settings, width, height, frameData
     ctx.globalAlpha = 1;
   }
 
-  // 4. Organic botanical markers — circle with 6 radial spokes
+  // 4. Diamond node markers with radial spokes
   const ms = settings.n4tOrganicRadius;
   ctx.lineWidth = lw * 0.55;
+  ctx.shadowColor = N4C;
+  ctx.shadowBlur = 4;
   for (const p of points) {
     ctx.globalAlpha = 0.35 + p.intensity * 0.45;
     ctx.strokeStyle = N4C;
+    const hs = ms * 0.65;
     ctx.beginPath();
-    ctx.arc(p.x, p.y, ms * 0.65, 0, Math.PI * 2);
+    ctx.moveTo(p.x, p.y - hs);
+    ctx.lineTo(p.x + hs, p.y);
+    ctx.lineTo(p.x, p.y + hs);
+    ctx.lineTo(p.x - hs, p.y);
+    ctx.closePath();
     ctx.stroke();
     ctx.beginPath();
-    for (let s = 0; s < 6; s++) {
-      const a = (s / 6) * Math.PI * 2;
+    for (let s = 0; s < 4; s++) {
+      const a = (s / 4) * Math.PI * 2 + Math.PI * 0.25;
       ctx.moveTo(p.x + Math.cos(a) * ms * 0.25, p.y + Math.sin(a) * ms * 0.25);
-      ctx.lineTo(p.x + Math.cos(a) * ms * 0.85, p.y + Math.sin(a) * ms * 0.85);
+      ctx.lineTo(p.x + Math.cos(a) * ms * 0.9, p.y + Math.sin(a) * ms * 0.9);
     }
     ctx.stroke();
   }
+  ctx.shadowBlur = 0;
 
-  // 5. Delicate connecting arcs between nearby points — like vines or currents
-  ctx.strokeStyle = N4S + "0.1)";
-  ctx.lineWidth = lw * 0.35;
+  // 5. Connecting arcs between nearby points — like vines or currents
+  ctx.strokeStyle = N4S + "0.55)";
+  ctx.lineWidth = lw * 0.5;
+  ctx.shadowColor = N4C;
+  ctx.shadowBlur = 6;
   for (let i = 0; i < points.length; i++) {
     for (let j = i + 1; j < points.length; j++) {
       const dx = points[i].x - points[j].x, dy = points[i].y - points[j].y;
@@ -401,6 +411,7 @@ function renderN4ture(ctx, points, triangles, settings, width, height, frameData
       if (d < width * 0.32 && d > width * 0.07) {
         const mx = (points[i].x + points[j].x) / 2, my = (points[i].y + points[j].y) / 2;
         const bulge = d * 0.12 * (Math.sin((i + j) * 1.3) > 0 ? 1 : -1);
+        ctx.globalAlpha = 0.3 + 0.4 * (1 - d / (width * 0.32));
         ctx.beginPath();
         ctx.moveTo(points[i].x, points[i].y);
         ctx.quadraticCurveTo(mx + (-dy / d) * bulge, my + (dx / d) * bulge, points[j].x, points[j].y);
@@ -408,6 +419,7 @@ function renderN4ture(ctx, points, triangles, settings, width, height, frameData
       }
     }
   }
+  ctx.shadowBlur = 0;
   ctx.globalAlpha = 1;
 
   // 6. Nature labels
@@ -592,6 +604,7 @@ export default function Tracer() {
   const prevGrayRef = useRef(null);
   const trailRef = useRef([]);
   const n4tBufferRef = useRef([]);
+  const n4tTrackedRef = useRef([]);
   const animRef = useRef(null);
   const recorderRef = useRef(null);
   const recordingLoopRef = useRef(null);
@@ -674,18 +687,45 @@ export default function Tracer() {
         else if (s.background === "dimmed") { ctx.drawImage(v,0,0,w,h); ctx.fillStyle=`rgba(0,0,0,${s.dimAmount})`; ctx.fillRect(0,0,w,h); }
         else ctx.drawImage(v, 0, 0, w, h);
 
-        const thresh = n4t ? s.n4tThreshold : s.motionThreshold;
         let rawPts = [];
-        rawPts = rawPts.concat(detectMotion(gray, prevGrayRef.current, w, h, thresh, s.sampleRate));
+        rawPts = rawPts.concat(detectMotion(gray, prevGrayRef.current, w, h, s.motionThreshold, s.sampleRate));
         if (s.showEdges && !n4t) rawPts = rawPts.concat(detectEdges(gray, w, h, s.sampleRate));
         prevGrayRef.current = gray;
 
         let points;
         if (n4t) {
-          n4tBufferRef.current.push(rawPts);
-          if (n4tBufferRef.current.length > s.n4tSmooth) n4tBufferRef.current.shift();
-          const pooled = n4tBufferRef.current.flat();
-          points = thinPoints(pooled, s.n4tPoints).map((p,i) => ({ ...p, idx: i }));
+          // Edge-based detection with spatial lock-on tracking to reduce flicker
+          const edgeThresh = s.n4tThreshold * 3;
+          const edges = detectEdges(gray, w, h, s.sampleRate, edgeThresh);
+          const snapR = w * 0.045;
+          const tracked = n4tTrackedRef.current;
+          const matched = new Set();
+          for (const tp of tracked) {
+            let best = null, bestD = snapR;
+            for (let i = 0; i < edges.length; i++) {
+              if (matched.has(i)) continue;
+              const d = Math.hypot(edges[i].x - tp.x, edges[i].y - tp.y);
+              if (d < bestD) { bestD = d; best = i; }
+            }
+            if (best !== null) {
+              matched.add(best);
+              tp.x += (edges[best].x - tp.x) * 0.2;
+              tp.y += (edges[best].y - tp.y) * 0.2;
+              tp.intensity = edges[best].intensity;
+              tp.age = (tp.age || 0) + 1;
+              tp.missed = 0;
+            } else {
+              tp.missed = (tp.missed || 0) + 1;
+            }
+          }
+          n4tTrackedRef.current = tracked.filter(tp => (tp.missed || 0) < s.n4tSmooth * 2);
+          for (let i = 0; i < edges.length; i++) {
+            if (!matched.has(i) && n4tTrackedRef.current.length < s.n4tPoints * 2) {
+              n4tTrackedRef.current.push({ ...edges[i], age: 0, missed: 0 });
+            }
+          }
+          const byAge = [...n4tTrackedRef.current].sort((a, b) => b.age - a.age);
+          points = thinPoints(byAge, s.n4tPoints).map((p, i) => ({ ...p, idx: i }));
         } else {
           points = thinPoints(rawPts, skx ? s.skxPoints : s.maxPoints).map((p,i) => ({ ...p, idx: i }));
         }
@@ -714,7 +754,7 @@ export default function Tracer() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:1920}, height:{ideal:1080} }, audio:false });
       const v = videoRef.current; v.srcObject=stream; v.muted=true; await v.play();
-      prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[];
+      prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[]; n4tTrackedRef.current=[];
       setSource("webcam"); setVideoName("Webcam");
     } catch(e) { console.error("Webcam error:", e); }
   }, []);
@@ -725,7 +765,7 @@ export default function Tracer() {
     const v = videoRef.current;
     if (v.srcObject) { v.srcObject.getTracks().forEach(t=>t.stop()); v.srcObject=null; }
     v.muted=true; v.playsInline=true; v.loop=true; v.preload="auto"; v.src=url;
-    prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[]; setVideoName(file.name);
+    prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[]; n4tTrackedRef.current=[]; setVideoName(file.name);
     const onReady = () => {
       v.removeEventListener("canplay",onReady); v.removeEventListener("loadeddata",onReady);
       v.play().then(()=>{setLoading(false);setSource("video")}).catch(()=>{setLoading(false);setSource("video")});
@@ -739,7 +779,7 @@ export default function Tracer() {
     const v = videoRef.current;
     if (v.srcObject) { v.srcObject.getTracks().forEach(t=>t.stop()); v.srcObject=null; }
     if (v.src) { v.pause(); v.removeAttribute("src"); v.load(); }
-    prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[];
+    prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[]; n4tTrackedRef.current=[];
     setSource("idle"); setVideoName("");
   }, []);
 
@@ -861,7 +901,7 @@ export default function Tracer() {
                 <Toggle label="Flow Lines" value={settings.n4tFlowLines} onChange={v=>set("n4tFlowLines",v)} color="#44ffaa" />
                 <Toggle label="Dewdrops" value={settings.n4tDewdrops} onChange={v=>set("n4tDewdrops",v)} color="#44ffaa" />
                 <Toggle label="Labels" value={settings.n4tLabels} onChange={v=>set("n4tLabels",v)} color="#44ffaa" />
-                <Slider label="Line Weight" value={settings.n4tLineWeight} min={0.3} max={3} step={0.1} onChange={v=>set("n4tLineWeight",v)} color="#44ffaa" />
+                <Slider label="Line Weight" value={settings.n4tLineWeight} min={0.3} max={8} step={0.1} onChange={v=>set("n4tLineWeight",v)} color="#44ffaa" />
               </Section>
             ) : (
               <>
