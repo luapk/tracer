@@ -43,7 +43,7 @@ const DEFAULTS = {
   n4tThreshold: 12,
   n4tSmooth: 4,
   n4tFlowLines: true,
-  n4tDewdrops: true,
+  n4tSwatches: true,
   n4tLabels: true,
   n4tOrganicRadius: 8,
   n4tLineWeight: 1.0,
@@ -120,6 +120,60 @@ function detectEdges(gray, w, h, step, threshold = 80) {
       if (mag > threshold) pts.push({ x, y, intensity: Math.min(mag/300, 1), type: "edge" });
     }
   return pts;
+}
+
+// Spatially-distributed feature detector: grid NMS keeps top features per cell
+// so points cover the whole frame instead of clustering on the densest region.
+function detectFeatures(gray, w, h, step, threshold, gridX, gridY) {
+  const cellW = w / gridX, cellH = h / gridY;
+  const cells = [];
+  for (let i = 0; i < gridX * gridY; i++) cells.push([]);
+  for (let y = step*2; y < h-step*2; y += step) {
+    for (let x = step*2; x < w-step*2; x += step) {
+      const i = y*w+x;
+      const gx = -gray[i-w-1]+gray[i-w+1]-2*gray[i-1]+2*gray[i+1]-gray[i+w-1]+gray[i+w+1];
+      const gy = -gray[i-w-1]-2*gray[i-w]-gray[i-w+1]+gray[i+w-1]+2*gray[i+w]+gray[i+w+1];
+      const mag = Math.sqrt(gx*gx+gy*gy);
+      if (mag < threshold) continue;
+      // Bias toward bright features (white flowers, water glints) and away from mid-grey leaf texture
+      const bright = gray[i] / 255;
+      const score = mag * (0.45 + bright * 0.85);
+      const cx = Math.min(gridX-1, Math.floor(x / cellW));
+      const cy = Math.min(gridY-1, Math.floor(y / cellH));
+      cells[cy*gridX + cx].push({ x, y, score, intensity: Math.min(mag/300, 1) });
+    }
+  }
+  const result = [];
+  for (const cell of cells) {
+    if (cell.length === 0) continue;
+    cell.sort((a, b) => b.score - a.score);
+    const take = Math.min(4, cell.length);
+    for (let k = 0; k < take; k++) result.push(cell[k]);
+  }
+  return result;
+}
+
+// Sub-pixel-ish local refinement: snap a tracked point to the strongest scored
+// edge within a small search window. Gives high-precision lock onto a moving shape.
+function refineToEdge(gray, w, h, x, y, searchR) {
+  const xi = Math.round(x), yi = Math.round(y);
+  let bestX = xi, bestY = yi, bestScore = 0;
+  for (let dy = -searchR; dy <= searchR; dy++) {
+    const ny = yi + dy;
+    if (ny < 1 || ny >= h - 1) continue;
+    for (let dx = -searchR; dx <= searchR; dx++) {
+      const nx = xi + dx;
+      if (nx < 1 || nx >= w - 1) continue;
+      const i = ny*w + nx;
+      const gx = -gray[i-w-1]+gray[i-w+1]-2*gray[i-1]+2*gray[i+1]-gray[i+w-1]+gray[i+w+1];
+      const gy = -gray[i-w-1]-2*gray[i-w]-gray[i-w+1]+gray[i+w-1]+2*gray[i+w]+gray[i+w+1];
+      const mag = Math.sqrt(gx*gx + gy*gy);
+      const bright = gray[i] / 255;
+      const score = mag * (0.45 + bright * 0.85);
+      if (score > bestScore) { bestScore = score; bestX = nx; bestY = ny; }
+    }
+  }
+  return { x: bestX, y: bestY, score: bestScore };
 }
 
 function thinPoints(points, maxCount) {
@@ -286,8 +340,16 @@ function renderN4ture(ctx, points, triangles, settings, width, height, frameData
   if (points.length === 0) return;
 
   const lw = settings.n4tLineWeight;
-  const N4C = "#44ffaa";
-  const N4S = "rgba(68,255,170,";
+  const N4C = "#ffffff";
+  const N4S = "rgba(255,255,255,";
+  const drawDiamond = (cx, cy, r) => {
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - r);
+    ctx.lineTo(cx + r, cy);
+    ctx.lineTo(cx, cy + r);
+    ctx.lineTo(cx - r, cy);
+    ctx.closePath();
+  };
 
   // 1. Flowing arcs extending to canvas edges — organic version of skx extend lines
   if (settings.n4tFlowLines) {
@@ -306,7 +368,7 @@ function renderN4ture(ctx, points, triangles, settings, width, height, frameData
         const len = Math.sqrt(ddx * ddx + ddy * ddy) || 1;
         const nx = -ddy / len, ny = ddx / len;
         const sway = Math.sin(i * 2.1) * width * 0.04;
-        ctx.strokeStyle = N4S + "0.06)";
+        ctx.strokeStyle = N4S + "0.18)";
         ctx.lineWidth = lw * 0.5;
         ctx.shadowBlur = 0;
         ctx.globalAlpha = 1;
@@ -352,22 +414,22 @@ function renderN4ture(ctx, points, triangles, settings, width, height, frameData
     ctx.shadowBlur = 0;
   }
 
-  // 3. Colour dewdrops — circular sampled colour at each vertex (like water on leaves)
-  if (frameData && settings.n4tDewdrops) {
+  // 3. Diamond colour swatches — sampled pixel colour at each tracked point, offset outward
+  if (frameData && settings.n4tSwatches) {
     const r = settings.n4tOrganicRadius;
     for (const p of points) {
       const col = sampleColor(frameData, p.x, p.y, width);
       const angle = Math.atan2(p.y - height / 2, p.x - width / 2);
-      const ox = Math.cos(angle + Math.PI) * (r * 1.8);
-      const oy = Math.sin(angle + Math.PI) * (r * 1.8);
-      ctx.globalAlpha = 0.55;
+      const ox = Math.cos(angle + Math.PI) * (r * 2.0);
+      const oy = Math.sin(angle + Math.PI) * (r * 2.0);
+      const cx = p.x + ox, cy = p.y + oy;
+      ctx.globalAlpha = 0.85;
       ctx.fillStyle = col;
-      ctx.beginPath();
-      ctx.arc(p.x + ox, p.y + oy, r, 0, Math.PI * 2);
+      drawDiamond(cx, cy, r);
       ctx.fill();
-      ctx.strokeStyle = N4S + "0.35)";
-      ctx.lineWidth = 0.5;
-      ctx.globalAlpha = 0.5;
+      ctx.strokeStyle = N4S + "0.85)";
+      ctx.lineWidth = lw * 0.6;
+      ctx.globalAlpha = 1;
       ctx.stroke();
     }
     ctx.globalAlpha = 1;
@@ -378,16 +440,11 @@ function renderN4ture(ctx, points, triangles, settings, width, height, frameData
   ctx.lineWidth = lw * 0.55;
   ctx.shadowColor = N4C;
   ctx.shadowBlur = 4;
+  const hs = ms * 0.65;
   for (const p of points) {
-    ctx.globalAlpha = 0.35 + p.intensity * 0.45;
+    ctx.globalAlpha = 0.45 + p.intensity * 0.45;
     ctx.strokeStyle = N4C;
-    const hs = ms * 0.65;
-    ctx.beginPath();
-    ctx.moveTo(p.x, p.y - hs);
-    ctx.lineTo(p.x + hs, p.y);
-    ctx.lineTo(p.x, p.y + hs);
-    ctx.lineTo(p.x - hs, p.y);
-    ctx.closePath();
+    drawDiamond(p.x, p.y, hs);
     ctx.stroke();
     ctx.beginPath();
     for (let s = 0; s < 4; s++) {
@@ -422,17 +479,30 @@ function renderN4ture(ctx, points, triangles, settings, width, height, frameData
   ctx.shadowBlur = 0;
   ctx.globalAlpha = 1;
 
-  // 6. Nature labels
+  // 6. Nature labels — diamond colour swatch + text id
   if (settings.n4tLabels) {
     ctx.shadowBlur = 0;
     const fs = Math.max(8, Math.round(width / 160));
     ctx.font = `${fs}px 'Courier New', monospace`;
-    ctx.globalAlpha = 0.4;
-    ctx.fillStyle = N4C;
     const names = ["stem", "blade", "frond", "ripple", "crest", "sway", "drift", "flow", "wave", "curl", "reed", "spore"];
+    const dr = fs * 0.55;
     for (let i = 0; i < points.length; i++) {
       const p = points[i];
-      ctx.fillText(`${names[i % names.length]}_${String(i).padStart(2, "0")}`, p.x + ms + 4, p.y + fs * 0.35);
+      const lx = p.x + ms + 6;
+      const ly = p.y;
+      if (frameData) {
+        const col = sampleColor(frameData, p.x, p.y, width);
+        ctx.globalAlpha = 0.9;
+        ctx.fillStyle = col;
+        drawDiamond(lx + dr, ly, dr);
+        ctx.fill();
+        ctx.strokeStyle = N4S + "0.85)";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 0.85;
+      ctx.fillStyle = N4C;
+      ctx.fillText(`${names[i % names.length]}_${String(i).padStart(2, "0")}`, lx + dr * 2 + 4, ly + fs * 0.35);
     }
     ctx.globalAlpha = 1;
   }
@@ -715,24 +785,22 @@ export default function Tracer() {
 
         let points;
         if (n4t) {
-          // Edge-based detection with spatial lock-on tracking to reduce flicker
+          // Grid-distributed feature detection + per-point local refinement.
+          // Grid NMS spreads candidates across the whole frame so we don't
+          // cluster on the densest texture region. Each tracked point then
+          // refines to the strongest local edge for high-precision lock-on.
           const edgeThresh = s.n4tThreshold * 3;
-          const edges = detectEdges(gray, w, h, s.sampleRate, edgeThresh);
-          const snapR = w * 0.045;
+          const gridX = 7, gridY = 7;
+          const features = detectFeatures(gray, w, h, s.sampleRate, edgeThresh, gridX, gridY);
           const tracked = n4tTrackedRef.current;
-          const matched = new Set();
+          const searchR = Math.max(4, Math.round(Math.min(w, h) * 0.012));
+          const minMag = edgeThresh * 0.7;
+
           for (const tp of tracked) {
-            let best = null, bestD = snapR;
-            for (let i = 0; i < edges.length; i++) {
-              if (matched.has(i)) continue;
-              const d = Math.hypot(edges[i].x - tp.x, edges[i].y - tp.y);
-              if (d < bestD) { bestD = d; best = i; }
-            }
-            if (best !== null) {
-              matched.add(best);
-              tp.x += (edges[best].x - tp.x) * 0.2;
-              tp.y += (edges[best].y - tp.y) * 0.2;
-              tp.intensity = edges[best].intensity;
+            const r = refineToEdge(gray, w, h, tp.x, tp.y, searchR);
+            if (r.score > minMag) {
+              tp.x = r.x; tp.y = r.y;
+              tp.intensity = Math.min(r.score / 400, 1);
               tp.age = (tp.age || 0) + 1;
               tp.missed = 0;
             } else {
@@ -740,13 +808,35 @@ export default function Tracer() {
             }
           }
           n4tTrackedRef.current = tracked.filter(tp => (tp.missed || 0) < s.n4tSmooth * 2);
-          for (let i = 0; i < edges.length; i++) {
-            if (!matched.has(i) && n4tTrackedRef.current.length < s.n4tPoints * 2) {
-              n4tTrackedRef.current.push({ ...edges[i], age: 0, missed: 0 });
-            }
+
+          // Seed new tracked points into under-populated grid cells
+          const cellW = w / gridX, cellH = h / gridY;
+          const cellCount = new Array(gridX * gridY).fill(0);
+          for (const tp of n4tTrackedRef.current) {
+            const cx = Math.min(gridX-1, Math.max(0, Math.floor(tp.x / cellW)));
+            const cy = Math.min(gridY-1, Math.max(0, Math.floor(tp.y / cellH)));
+            cellCount[cy*gridX + cx]++;
           }
-          const byAge = [...n4tTrackedRef.current].sort((a, b) => b.age - a.age);
-          points = thinPoints(byAge, s.n4tPoints).map((p, i) => ({ ...p, idx: i }));
+          const targetPerCell = Math.max(1, Math.ceil(s.n4tPoints / (gridX * gridY * 0.55)));
+          const minDist = Math.min(w, h) * 0.04;
+          for (const f of features) {
+            if (n4tTrackedRef.current.length >= s.n4tPoints * 1.4) break;
+            const cx = Math.min(gridX-1, Math.floor(f.x / cellW));
+            const cy = Math.min(gridY-1, Math.floor(f.y / cellH));
+            const idx = cy*gridX + cx;
+            if (cellCount[idx] >= targetPerCell) continue;
+            let tooClose = false;
+            for (const tp of n4tTrackedRef.current) {
+              if (Math.hypot(tp.x - f.x, tp.y - f.y) < minDist) { tooClose = true; break; }
+            }
+            if (tooClose) continue;
+            n4tTrackedRef.current.push({ x: f.x, y: f.y, intensity: f.intensity, age: 0, missed: 0 });
+            cellCount[idx]++;
+          }
+
+          // Prefer the most stable (oldest) tracked points
+          const sorted = [...n4tTrackedRef.current].sort((a, b) => (b.age - a.age) || (b.intensity - a.intensity));
+          points = sorted.slice(0, s.n4tPoints).map((p, i) => ({ ...p, idx: i }));
         } else {
           points = thinPoints(rawPts, skx ? s.skxPoints : s.maxPoints).map((p,i) => ({ ...p, idx: i }));
         }
@@ -926,7 +1016,7 @@ export default function Tracer() {
                 <Slider label="Smooth Frames" value={settings.n4tSmooth} min={1} max={10} step={1} onChange={v=>set("n4tSmooth",v)} color="#44ffaa" />
                 <Slider label="Organic Radius" value={settings.n4tOrganicRadius} min={4} max={20} step={1} onChange={v=>set("n4tOrganicRadius",v)} color="#44ffaa" />
                 <Toggle label="Flow Lines" value={settings.n4tFlowLines} onChange={v=>set("n4tFlowLines",v)} color="#44ffaa" />
-                <Toggle label="Dewdrops" value={settings.n4tDewdrops} onChange={v=>set("n4tDewdrops",v)} color="#44ffaa" />
+                <Toggle label="Swatches" value={settings.n4tSwatches} onChange={v=>set("n4tSwatches",v)} color="#44ffaa" />
                 <Toggle label="Labels" value={settings.n4tLabels} onChange={v=>set("n4tLabels",v)} color="#44ffaa" />
                 <Slider label="Line Weight" value={settings.n4tLineWeight} min={0.3} max={8} step={0.1} onChange={v=>set("n4tLineWeight",v)} color="#44ffaa" />
               </Section>
