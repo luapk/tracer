@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback } from "react";
 
 /* ═══════════════════════════════════════════════════
    TRACER v1.2 — Motion Tracking Overlay Engine
-   Delaunay + Skeletrix render modes
+   Delaunay + Skeletrix + N4ture render modes
    ═══════════════════════════════════════════════════ */
 
 const COLORS = {
@@ -38,6 +38,15 @@ const DEFAULTS = {
   skxMarkerSize: 6,
   skxExtendLines: true,
   skxLabels: true,
+  // N4ture
+  n4tPoints: 30,
+  n4tThreshold: 12,
+  n4tSmooth: 4,
+  n4tFlowLines: true,
+  n4tDewdrops: true,
+  n4tLabels: true,
+  n4tOrganicRadius: 8,
+  n4tLineWeight: 1.0,
 };
 
 /* ─── Delaunay Triangulation (Bowyer-Watson) ─── */
@@ -270,6 +279,153 @@ function renderSkeletrix(ctx, points, triangles, settings, colors, width, height
   }
 }
 
+/* ─── N4ture Renderer ─── */
+
+function renderN4ture(ctx, points, triangles, settings, width, height, frameData) {
+  ctx.clearRect(0, 0, width, height);
+  if (points.length === 0) return;
+
+  const lw = settings.n4tLineWeight;
+  const N4C = "#44ffaa";
+  const N4S = "rgba(68,255,170,";
+
+  // 1. Flowing arcs extending to canvas edges — organic version of skx extend lines
+  if (settings.n4tFlowLines) {
+    const extStep = Math.max(1, Math.floor(points.length / Math.max(6, points.length * 0.4)));
+    for (let i = 0; i < points.length; i += extStep) {
+      const p = points[i];
+      let nearest = null, nd = Infinity;
+      for (let j = 0; j < points.length; j++) {
+        if (j === i) continue;
+        const d = (points[j].x - p.x) ** 2 + (points[j].y - p.y) ** 2;
+        if (d < nd) { nd = d; nearest = points[j]; }
+      }
+      if (nearest) {
+        const e = extendToEdge(p.x, p.y, nearest.x, nearest.y, width, height);
+        const ddx = e.x - p.x, ddy = e.y - p.y;
+        const len = Math.sqrt(ddx * ddx + ddy * ddy) || 1;
+        const nx = -ddy / len, ny = ddx / len;
+        const sway = Math.sin(i * 2.1) * width * 0.04;
+        ctx.strokeStyle = N4S + "0.06)";
+        ctx.lineWidth = lw * 0.5;
+        ctx.shadowBlur = 0;
+        ctx.globalAlpha = 1;
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+        ctx.quadraticCurveTo(p.x + ddx * 0.5 + nx * sway, p.y + ddy * 0.5 + ny * sway, e.x, e.y);
+        ctx.stroke();
+        // Reverse arc
+        const e2 = extendToEdge(p.x, p.y, p.x - (nearest.x - p.x), p.y - (nearest.y - p.y), width, height);
+        const d2x = e2.x - p.x, d2y = e2.y - p.y;
+        const len2 = Math.sqrt(d2x * d2x + d2y * d2y) || 1;
+        const n2x = -d2y / len2, n2y = d2x / len2;
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+        ctx.quadraticCurveTo(p.x + d2x * 0.5 + n2x * (-sway), p.y + d2y * 0.5 + n2y * (-sway), e2.x, e2.y);
+        ctx.stroke();
+      }
+    }
+  }
+
+  // 2. Triangle edges as gentle organic arcs
+  if (triangles.length > 0) {
+    ctx.strokeStyle = N4S + "0.35)";
+    ctx.lineWidth = lw * 0.7;
+    ctx.shadowColor = N4C;
+    ctx.shadowBlur = 3;
+    ctx.globalAlpha = 1;
+    const drawArc = (ax, ay, bx, by) => {
+      const mx = (ax + bx) / 2, my = (ay + by) / 2;
+      const ddx = bx - ax, ddy = by - ay;
+      const len = Math.sqrt(ddx * ddx + ddy * ddy) || 1;
+      const bulge = len * 0.08;
+      ctx.beginPath();
+      ctx.moveTo(ax, ay);
+      ctx.quadraticCurveTo(mx + (-ddy / len) * bulge, my + (ddx / len) * bulge, bx, by);
+      ctx.stroke();
+    };
+    for (const tri of triangles) {
+      drawArc(tri.a.x, tri.a.y, tri.b.x, tri.b.y);
+      drawArc(tri.b.x, tri.b.y, tri.c.x, tri.c.y);
+      drawArc(tri.c.x, tri.c.y, tri.a.x, tri.a.y);
+    }
+    ctx.shadowBlur = 0;
+  }
+
+  // 3. Colour dewdrops — circular sampled colour at each vertex (like water on leaves)
+  if (frameData && settings.n4tDewdrops) {
+    const r = settings.n4tOrganicRadius;
+    for (const p of points) {
+      const col = sampleColor(frameData, p.x, p.y, width);
+      const angle = Math.atan2(p.y - height / 2, p.x - width / 2);
+      const ox = Math.cos(angle + Math.PI) * (r * 1.8);
+      const oy = Math.sin(angle + Math.PI) * (r * 1.8);
+      ctx.globalAlpha = 0.55;
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.arc(p.x + ox, p.y + oy, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = N4S + "0.35)";
+      ctx.lineWidth = 0.5;
+      ctx.globalAlpha = 0.5;
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // 4. Organic botanical markers — circle with 6 radial spokes
+  const ms = settings.n4tOrganicRadius;
+  ctx.lineWidth = lw * 0.55;
+  for (const p of points) {
+    ctx.globalAlpha = 0.35 + p.intensity * 0.45;
+    ctx.strokeStyle = N4C;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, ms * 0.65, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    for (let s = 0; s < 6; s++) {
+      const a = (s / 6) * Math.PI * 2;
+      ctx.moveTo(p.x + Math.cos(a) * ms * 0.25, p.y + Math.sin(a) * ms * 0.25);
+      ctx.lineTo(p.x + Math.cos(a) * ms * 0.85, p.y + Math.sin(a) * ms * 0.85);
+    }
+    ctx.stroke();
+  }
+
+  // 5. Delicate connecting arcs between nearby points — like vines or currents
+  ctx.strokeStyle = N4S + "0.1)";
+  ctx.lineWidth = lw * 0.35;
+  for (let i = 0; i < points.length; i++) {
+    for (let j = i + 1; j < points.length; j++) {
+      const dx = points[i].x - points[j].x, dy = points[i].y - points[j].y;
+      const d = Math.sqrt(dx * dx + dy * dy);
+      if (d < width * 0.32 && d > width * 0.07) {
+        const mx = (points[i].x + points[j].x) / 2, my = (points[i].y + points[j].y) / 2;
+        const bulge = d * 0.12 * (Math.sin((i + j) * 1.3) > 0 ? 1 : -1);
+        ctx.beginPath();
+        ctx.moveTo(points[i].x, points[i].y);
+        ctx.quadraticCurveTo(mx + (-dy / d) * bulge, my + (dx / d) * bulge, points[j].x, points[j].y);
+        ctx.stroke();
+      }
+    }
+  }
+  ctx.globalAlpha = 1;
+
+  // 6. Nature labels
+  if (settings.n4tLabels) {
+    ctx.shadowBlur = 0;
+    const fs = Math.max(8, Math.round(width / 160));
+    ctx.font = `${fs}px 'Courier New', monospace`;
+    ctx.globalAlpha = 0.4;
+    ctx.fillStyle = N4C;
+    const names = ["stem", "blade", "frond", "ripple", "crest", "sway", "drift", "flow", "wave", "curl", "reed", "spore"];
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      ctx.fillText(`${names[i % names.length]}_${String(i).padStart(2, "0")}`, p.x + ms + 4, p.y + fs * 0.35);
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
 /* ─── Delaunay Renderer (existing) ─── */
 
 function renderDelaunay(ctx, points, triangles, trailBuffer, settings, colors, width, height) {
@@ -435,6 +591,7 @@ export default function Tracer() {
   const offscreenRef = useRef(null);
   const prevGrayRef = useRef(null);
   const trailRef = useRef([]);
+  const n4tBufferRef = useRef([]);
   const animRef = useRef(null);
   const recorderRef = useRef(null);
   const recordingLoopRef = useRef(null);
@@ -451,6 +608,7 @@ export default function Tracer() {
   const colors = COLORS[settings.colorScheme];
   const set = useCallback((key, val) => setSettings(s => ({ ...s, [key]: val })), []);
   const isSkx = settings.renderMode === "skeletrix";
+  const isN4t = settings.renderMode === "n4ture";
 
   useEffect(() => {
     const c = canvasRef.current, o = overlayRef.current;
@@ -479,6 +637,7 @@ export default function Tracer() {
       const w = c.width, h = c.height;
       const s = settingsRef.current, col = COLORS[s.colorScheme];
       const skx = s.renderMode === "skeletrix";
+      const n4t = s.renderMode === "n4ture";
 
       fpsRef.current.frames++;
       if (time - fpsRef.current.last > 1000) { setFps(fpsRef.current.frames); fpsRef.current.frames=0; fpsRef.current.last=time; }
@@ -486,11 +645,15 @@ export default function Tracer() {
       if (sourceRef.current === "idle") {
         ctx.fillStyle = "#0a0a0a"; ctx.fillRect(0, 0, w, h);
         const pts = generateIdlePoints(time/1000, w, h);
-        const thinned = skx ? thinPoints(pts, s.skxPoints).map((p,i)=>({...p,idx:i})) : pts;
+        const thinned = skx ? thinPoints(pts, s.skxPoints).map((p,i)=>({...p,idx:i}))
+                      : n4t ? thinPoints(pts, s.n4tPoints).map((p,i)=>({...p,idx:i}))
+                      : pts;
         const tris = delaunay(thinned);
         setPointCount(thinned.length); setTriCount(tris.length);
         if (skx) {
           renderSkeletrix(overlayCtx, thinned, tris, s, col, w, h, null);
+        } else if (n4t) {
+          renderN4ture(overlayCtx, thinned, tris, s, w, h, null);
         } else {
           trailRef.current.push(thinned);
           if (trailRef.current.length > s.trailLength) trailRef.current.shift();
@@ -511,18 +674,28 @@ export default function Tracer() {
         else if (s.background === "dimmed") { ctx.drawImage(v,0,0,w,h); ctx.fillStyle=`rgba(0,0,0,${s.dimAmount})`; ctx.fillRect(0,0,w,h); }
         else ctx.drawImage(v, 0, 0, w, h);
 
+        const thresh = n4t ? s.n4tThreshold : s.motionThreshold;
         let rawPts = [];
-        rawPts = rawPts.concat(detectMotion(gray, prevGrayRef.current, w, h, s.motionThreshold, s.sampleRate));
-        if (s.showEdges) rawPts = rawPts.concat(detectEdges(gray, w, h, s.sampleRate));
+        rawPts = rawPts.concat(detectMotion(gray, prevGrayRef.current, w, h, thresh, s.sampleRate));
+        if (s.showEdges && !n4t) rawPts = rawPts.concat(detectEdges(gray, w, h, s.sampleRate));
         prevGrayRef.current = gray;
 
-        const maxPts = skx ? s.skxPoints : s.maxPoints;
-        const points = thinPoints(rawPts, maxPts).map((p,i) => ({ ...p, idx: i }));
+        let points;
+        if (n4t) {
+          n4tBufferRef.current.push(rawPts);
+          if (n4tBufferRef.current.length > s.n4tSmooth) n4tBufferRef.current.shift();
+          const pooled = n4tBufferRef.current.flat();
+          points = thinPoints(pooled, s.n4tPoints).map((p,i) => ({ ...p, idx: i }));
+        } else {
+          points = thinPoints(rawPts, skx ? s.skxPoints : s.maxPoints).map((p,i) => ({ ...p, idx: i }));
+        }
         const tris = points.length >= 3 ? delaunay(points) : [];
         setPointCount(points.length); setTriCount(tris.length);
 
         if (skx) {
           renderSkeletrix(overlayCtx, points, tris, s, col, w, h, frame.data);
+        } else if (n4t) {
+          renderN4ture(overlayCtx, points, tris, s, w, h, frame.data);
         } else {
           trailRef.current.push(points);
           if (trailRef.current.length > s.trailLength) trailRef.current.shift();
@@ -541,7 +714,7 @@ export default function Tracer() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:1920}, height:{ideal:1080} }, audio:false });
       const v = videoRef.current; v.srcObject=stream; v.muted=true; await v.play();
-      prevGrayRef.current=null; trailRef.current=[];
+      prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[];
       setSource("webcam"); setVideoName("Webcam");
     } catch(e) { console.error("Webcam error:", e); }
   }, []);
@@ -552,7 +725,7 @@ export default function Tracer() {
     const v = videoRef.current;
     if (v.srcObject) { v.srcObject.getTracks().forEach(t=>t.stop()); v.srcObject=null; }
     v.muted=true; v.playsInline=true; v.loop=true; v.preload="auto"; v.src=url;
-    prevGrayRef.current=null; trailRef.current=[]; setVideoName(file.name);
+    prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[]; setVideoName(file.name);
     const onReady = () => {
       v.removeEventListener("canplay",onReady); v.removeEventListener("loadeddata",onReady);
       v.play().then(()=>{setLoading(false);setSource("video")}).catch(()=>{setLoading(false);setSource("video")});
@@ -566,7 +739,7 @@ export default function Tracer() {
     const v = videoRef.current;
     if (v.srcObject) { v.srcObject.getTracks().forEach(t=>t.stop()); v.srcObject=null; }
     if (v.src) { v.pause(); v.removeAttribute("src"); v.load(); }
-    prevGrayRef.current=null; trailRef.current=[];
+    prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[];
     setSource("idle"); setVideoName("");
   }, []);
 
@@ -610,7 +783,7 @@ export default function Tracer() {
           <span style={{ fontSize:9, color:"#555", letterSpacing:2, paddingTop:2 }}>v1.2</span>
         </div>
         <div style={{ display:"flex", alignItems:"center", gap:16, fontSize:10, color:"#555" }}>
-          <span style={{ color: isSkx ? "#ff44ff" : colors.primary, opacity: 0.7 }}>{isSkx ? "SKX" : "DLN"}</span>
+          <span style={{ color: isSkx ? "#ff44ff" : isN4t ? "#44ffaa" : colors.primary, opacity: 0.7 }}>{isSkx ? "SKX" : isN4t ? "N4T" : "DLN"}</span>
           <span>{pointCount} PTS</span>
           <span>{triCount} TRI</span>
           <span>{fps} FPS</span>
@@ -652,12 +825,12 @@ export default function Tracer() {
             {/* Render mode toggle */}
             <div style={{ fontSize:10, color:"#555", letterSpacing:3, marginBottom:12 }}>RENDER MODE</div>
             <div style={{ display:"flex", gap:6, marginBottom:4 }}>
-              {[["delaunay","DELAUNAY"],["skeletrix","SKELETRIX"]].map(([mode, label]) => (
+              {[["delaunay","DELAUNAY"],["skeletrix","SKELETRIX"],["n4ture","N4TURE"]].map(([mode, label]) => (
                 <button key={mode} onClick={()=>set("renderMode",mode)} style={{
                   flex:1, padding:"7px 0", fontSize:9, letterSpacing:1, textTransform:"uppercase",
-                  background: settings.renderMode===mode ? (mode==="skeletrix"?"rgba(255,68,255,0.15)":colors.glow) : "transparent",
-                  border: `1px solid ${settings.renderMode===mode ? (mode==="skeletrix"?"#ff44ff":colors.primary) : "#333"}`,
-                  color: settings.renderMode===mode ? (mode==="skeletrix"?"#ff44ff":colors.primary) : "#666",
+                  background: settings.renderMode===mode ? (mode==="skeletrix"?"rgba(255,68,255,0.15)":mode==="n4ture"?"rgba(68,255,170,0.15)":colors.glow) : "transparent",
+                  border: `1px solid ${settings.renderMode===mode ? (mode==="skeletrix"?"#ff44ff":mode==="n4ture"?"#44ffaa":colors.primary) : "#333"}`,
+                  color: settings.renderMode===mode ? (mode==="skeletrix"?"#ff44ff":mode==="n4ture"?"#44ffaa":colors.primary) : "#666",
                   fontFamily:"'Courier New',monospace", cursor:"pointer", borderRadius:0,
                 }}>{label}</button>
               ))}
@@ -678,6 +851,17 @@ export default function Tracer() {
                 <Toggle label="Extend Lines" value={settings.skxExtendLines} onChange={v=>set("skxExtendLines",v)} color="#ff44ff" />
                 <Toggle label="Labels" value={settings.skxLabels} onChange={v=>set("skxLabels",v)} color="#ff44ff" />
                 <Slider label="Line Weight" value={settings.lineWeight} min={0.3} max={3} step={0.1} onChange={v=>set("lineWeight",v)} color="#ff44ff" />
+              </Section>
+            ) : isN4t ? (
+              <Section title="N4TURE">
+                <Slider label="Track Points" value={settings.n4tPoints} min={8} max={60} step={1} onChange={v=>set("n4tPoints",v)} color="#44ffaa" />
+                <Slider label="Sensitivity" value={settings.n4tThreshold} min={5} max={50} step={1} onChange={v=>set("n4tThreshold",v)} color="#44ffaa" />
+                <Slider label="Smooth Frames" value={settings.n4tSmooth} min={1} max={10} step={1} onChange={v=>set("n4tSmooth",v)} color="#44ffaa" />
+                <Slider label="Organic Radius" value={settings.n4tOrganicRadius} min={4} max={20} step={1} onChange={v=>set("n4tOrganicRadius",v)} color="#44ffaa" />
+                <Toggle label="Flow Lines" value={settings.n4tFlowLines} onChange={v=>set("n4tFlowLines",v)} color="#44ffaa" />
+                <Toggle label="Dewdrops" value={settings.n4tDewdrops} onChange={v=>set("n4tDewdrops",v)} color="#44ffaa" />
+                <Toggle label="Labels" value={settings.n4tLabels} onChange={v=>set("n4tLabels",v)} color="#44ffaa" />
+                <Slider label="Line Weight" value={settings.n4tLineWeight} min={0.3} max={3} step={0.1} onChange={v=>set("n4tLineWeight",v)} color="#44ffaa" />
               </Section>
             ) : (
               <>
