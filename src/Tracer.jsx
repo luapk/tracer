@@ -368,7 +368,7 @@ function renderN4ture(ctx, points, triangles, settings, width, height, frameData
         const len = Math.sqrt(ddx * ddx + ddy * ddy) || 1;
         const nx = -ddy / len, ny = ddx / len;
         const sway = Math.sin(i * 2.1) * width * 0.04;
-        ctx.strokeStyle = N4S + "0.18)";
+        ctx.strokeStyle = N4S + "0.1)";
         ctx.lineWidth = lw * 0.5;
         ctx.shadowBlur = 0;
         ctx.globalAlpha = 1;
@@ -391,10 +391,10 @@ function renderN4ture(ctx, points, triangles, settings, width, height, frameData
 
   // 2. Triangle edges as gentle organic arcs
   if (triangles.length > 0) {
-    ctx.strokeStyle = N4S + "0.35)";
-    ctx.lineWidth = lw * 0.7;
+    ctx.strokeStyle = N4S + "0.7)";
+    ctx.lineWidth = lw * 1.0;
     ctx.shadowColor = N4C;
-    ctx.shadowBlur = 3;
+    ctx.shadowBlur = 4;
     ctx.globalAlpha = 1;
     const drawArc = (ax, ay, bx, by) => {
       const mx = (ax + bx) / 2, my = (ay + by) / 2;
@@ -457,10 +457,10 @@ function renderN4ture(ctx, points, triangles, settings, width, height, frameData
   ctx.shadowBlur = 0;
 
   // 5. Connecting arcs between nearby points — like vines or currents
-  ctx.strokeStyle = N4S + "0.55)";
-  ctx.lineWidth = lw * 0.5;
+  ctx.strokeStyle = N4S + "0.18)";
+  ctx.lineWidth = lw * 0.55;
   ctx.shadowColor = N4C;
-  ctx.shadowBlur = 6;
+  ctx.shadowBlur = 5;
   for (let i = 0; i < points.length; i++) {
     for (let j = i + 1; j < points.length; j++) {
       const dx = points[i].x - points[j].x, dy = points[i].y - points[j].y;
@@ -785,58 +785,19 @@ export default function Tracer() {
 
         let points;
         if (n4t) {
-          // Grid-distributed feature detection + per-point local refinement.
-          // Grid NMS spreads candidates across the whole frame so we don't
-          // cluster on the densest texture region. Each tracked point then
-          // refines to the strongest local edge for high-precision lock-on.
-          const edgeThresh = s.n4tThreshold * 3;
-          const gridX = 7, gridY = 7;
-          const features = detectFeatures(gray, w, h, s.sampleRate, edgeThresh, gridX, gridY);
-          const tracked = n4tTrackedRef.current;
-          const searchR = Math.max(4, Math.round(Math.min(w, h) * 0.012));
-          const minMag = edgeThresh * 0.7;
-
-          for (const tp of tracked) {
-            const r = refineToEdge(gray, w, h, tp.x, tp.y, searchR);
-            if (r.score > minMag) {
-              tp.x = r.x; tp.y = r.y;
-              tp.intensity = Math.min(r.score / 400, 1);
-              tp.age = (tp.age || 0) + 1;
-              tp.missed = 0;
-            } else {
-              tp.missed = (tp.missed || 0) + 1;
-            }
+          // Same pipeline as Skeletrix: motion + edges → thinPoints.
+          // Luminance weight biases the intensity sort toward bright subjects
+          // (white flowers, water glints) so they win over dark leaf texture.
+          let rawPts = detectMotion(gray, prevGrayRef.current, w, h, s.n4tThreshold, s.sampleRate);
+          rawPts = rawPts.concat(detectEdges(gray, w, h, s.sampleRate, s.n4tThreshold * 2));
+          for (const pt of rawPts) {
+            const lum = gray[Math.round(pt.y) * w + Math.round(pt.x)] / 255;
+            pt.intensity *= (0.25 + 0.75 * lum * lum);
           }
-          n4tTrackedRef.current = tracked.filter(tp => (tp.missed || 0) < s.n4tSmooth * 2);
-
-          // Seed new tracked points into under-populated grid cells
-          const cellW = w / gridX, cellH = h / gridY;
-          const cellCount = new Array(gridX * gridY).fill(0);
-          for (const tp of n4tTrackedRef.current) {
-            const cx = Math.min(gridX-1, Math.max(0, Math.floor(tp.x / cellW)));
-            const cy = Math.min(gridY-1, Math.max(0, Math.floor(tp.y / cellH)));
-            cellCount[cy*gridX + cx]++;
-          }
-          const targetPerCell = Math.max(1, Math.ceil(s.n4tPoints / (gridX * gridY * 0.55)));
-          const minDist = Math.min(w, h) * 0.04;
-          for (const f of features) {
-            if (n4tTrackedRef.current.length >= s.n4tPoints * 1.4) break;
-            const cx = Math.min(gridX-1, Math.floor(f.x / cellW));
-            const cy = Math.min(gridY-1, Math.floor(f.y / cellH));
-            const idx = cy*gridX + cx;
-            if (cellCount[idx] >= targetPerCell) continue;
-            let tooClose = false;
-            for (const tp of n4tTrackedRef.current) {
-              if (Math.hypot(tp.x - f.x, tp.y - f.y) < minDist) { tooClose = true; break; }
-            }
-            if (tooClose) continue;
-            n4tTrackedRef.current.push({ x: f.x, y: f.y, intensity: f.intensity, age: 0, missed: 0 });
-            cellCount[idx]++;
-          }
-
-          // Prefer the most stable (oldest) tracked points
-          const sorted = [...n4tTrackedRef.current].sort((a, b) => (b.age - a.age) || (b.intensity - a.intensity));
-          points = sorted.slice(0, s.n4tPoints).map((p, i) => ({ ...p, idx: i }));
+          n4tBufferRef.current.push(rawPts);
+          if (n4tBufferRef.current.length > s.n4tSmooth) n4tBufferRef.current.shift();
+          const pooled = n4tBufferRef.current.flat();
+          points = thinPoints(pooled, s.n4tPoints).map((p, i) => ({ ...p, idx: i }));
         } else {
           points = thinPoints(rawPts, skx ? s.skxPoints : s.maxPoints).map((p,i) => ({ ...p, idx: i }));
         }
