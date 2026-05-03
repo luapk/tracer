@@ -605,6 +605,8 @@ export default function Tracer() {
   const trailRef = useRef([]);
   const n4tBufferRef = useRef([]);
   const n4tTrackedRef = useRef([]);
+  const videoAspectRef = useRef(null);
+  const resizeFnRef = useRef(null);
   const animRef = useRef(null);
   const recorderRef = useRef(null);
   const recordingLoopRef = useRef(null);
@@ -628,11 +630,30 @@ export default function Tracer() {
     if (!c || !o) return;
     const resize = () => {
       const rect = c.parentElement.getBoundingClientRect();
-      const w = Math.floor(rect.width), h = Math.floor(rect.height);
+      const containerW = Math.floor(rect.width), containerH = Math.floor(rect.height);
+      let w, h, left, top;
+      const aspect = videoAspectRef.current;
+      if (aspect) {
+        if (containerW / containerH > aspect) {
+          h = containerH; w = Math.floor(h * aspect);
+        } else {
+          w = containerW; h = Math.floor(w / aspect);
+        }
+        left = Math.floor((containerW - w) / 2);
+        top = Math.floor((containerH - h) / 2);
+      } else {
+        w = containerW; h = containerH; left = 0; top = 0;
+      }
       c.width = w; c.height = h; o.width = w; o.height = h;
+      [c, o].forEach(el => {
+        el.style.width = w + "px"; el.style.height = h + "px";
+        el.style.left = left + "px"; el.style.top = top + "px";
+        el.style.right = "auto"; el.style.bottom = "auto";
+      });
       if (!offscreenRef.current) offscreenRef.current = document.createElement("canvas");
       offscreenRef.current.width = w; offscreenRef.current.height = h;
     };
+    resizeFnRef.current = resize;
     resize();
     window.addEventListener("resize", resize);
     return () => window.removeEventListener("resize", resize);
@@ -755,6 +776,7 @@ export default function Tracer() {
       const stream = await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:1920}, height:{ideal:1080} }, audio:false });
       const v = videoRef.current; v.srcObject=stream; v.muted=true; await v.play();
       prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[]; n4tTrackedRef.current=[];
+      if (v.videoWidth && v.videoHeight) { videoAspectRef.current = v.videoWidth / v.videoHeight; if (resizeFnRef.current) resizeFnRef.current(); }
       setSource("webcam"); setVideoName("Webcam");
     } catch(e) { console.error("Webcam error:", e); }
   }, []);
@@ -768,6 +790,10 @@ export default function Tracer() {
     prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[]; n4tTrackedRef.current=[]; setVideoName(file.name);
     const onReady = () => {
       v.removeEventListener("canplay",onReady); v.removeEventListener("loadeddata",onReady);
+      if (v.videoWidth && v.videoHeight) {
+        videoAspectRef.current = v.videoWidth / v.videoHeight;
+        if (resizeFnRef.current) resizeFnRef.current();
+      }
       v.play().then(()=>{setLoading(false);setSource("video")}).catch(()=>{setLoading(false);setSource("video")});
     };
     v.addEventListener("canplay",onReady); v.addEventListener("loadeddata",onReady);
@@ -780,6 +806,7 @@ export default function Tracer() {
     if (v.srcObject) { v.srcObject.getTracks().forEach(t=>t.stop()); v.srcObject=null; }
     if (v.src) { v.pause(); v.removeAttribute("src"); v.load(); }
     prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[]; n4tTrackedRef.current=[];
+    videoAspectRef.current = null; if (resizeFnRef.current) resizeFnRef.current();
     setSource("idle"); setVideoName("");
   }, []);
 
