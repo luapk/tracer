@@ -47,6 +47,26 @@ const DEFAULTS = {
   n4tLabels: true,
   n4tOrganicRadius: 8,
   n4tLineWeight: 1.0,
+  // Surveil
+  survPoints: 18,
+  survThreshold: 22,
+  survLineWeight: 1.2,
+  survBrackets: true,
+  survCrosshair: true,
+  survHud: true,
+  survScanLine: true,
+  survPixelate: true,
+  survBracketSize: 44,
+  // Mocap
+  mocPoints: 42,
+  mocThreshold: 16,
+  mocLineWeight: 1.0,
+  mocVectors: true,
+  mocWireframe: true,
+  mocGrid: true,
+  mocData: true,
+  mocRgb: true,
+  mocVectorScale: 4,
 };
 
 /* ─── Delaunay Triangulation (Bowyer-Watson) ─── */
@@ -505,6 +525,269 @@ function renderN4ture(ctx, points, triangles, settings, width, height, frameData
   }
 }
 
+/* ─── Surveil Renderer ─── */
+
+function renderSurveil(ctx, points, settings, width, height, frameData, elapsed) {
+  ctx.clearRect(0, 0, width, height);
+  const lw = settings.survLineWeight;
+  const COL = "#ff3838";
+  const CS = "rgba(255,56,56,";
+
+  if (settings.survScanLine) {
+    const sy = (elapsed * 80) % (height + 120) - 60;
+    const grd = ctx.createLinearGradient(0, sy - 60, 0, sy + 60);
+    grd.addColorStop(0, CS + "0)");
+    grd.addColorStop(0.5, CS + "0.14)");
+    grd.addColorStop(1, CS + "0)");
+    ctx.fillStyle = grd;
+    ctx.fillRect(0, sy - 60, width, 120);
+    ctx.strokeStyle = CS + "0.45)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, sy); ctx.lineTo(width, sy);
+    ctx.stroke();
+  }
+
+  const fs = Math.max(9, Math.round(width / 180));
+  const monoFont = `${fs}px 'Courier New', monospace`;
+  const bigFont = `${Math.round(fs*1.15)}px 'Courier New', monospace`;
+
+  if (settings.survHud) {
+    ctx.font = bigFont;
+    ctx.fillStyle = COL;
+    ctx.globalAlpha = 0.95;
+    const secs = elapsed;
+    const hh = String(Math.floor(secs/3600)%24).padStart(2,"0");
+    const mm = String(Math.floor(secs/60)%60).padStart(2,"0");
+    const ss = String(Math.floor(secs)%60).padStart(2,"0");
+    const cs = String(Math.floor((secs%1)*100)).padStart(2,"0");
+    // Blinking REC dot
+    if (Math.floor(elapsed*2) % 2 === 0) {
+      ctx.beginPath(); ctx.arc(14, fs + 2, fs*0.35, 0, Math.PI*2); ctx.fill();
+    }
+    ctx.fillText(`REC  ${hh}:${mm}:${ss}.${cs}`, 26, fs + 6);
+    ctx.fillText(`TRACKING ${String(points.length).padStart(2,"0")} TARGETS`, 26, fs*2 + 12);
+    const right = `CH_01 // ISR-CAM  ${width}x${height}`;
+    ctx.textAlign = "right";
+    ctx.fillText(right, width - 14, fs + 6);
+    ctx.fillText(`LAT 00.000  LON 00.000`, width - 14, fs*2 + 12);
+    ctx.textAlign = "left";
+    // Frame corner brackets
+    const fb = 22, fw = lw * 1.5;
+    ctx.lineWidth = fw;
+    ctx.strokeStyle = COL;
+    ctx.beginPath();
+    ctx.moveTo(6, 6+fb); ctx.lineTo(6,6); ctx.lineTo(6+fb,6);
+    ctx.moveTo(width-6-fb,6); ctx.lineTo(width-6,6); ctx.lineTo(width-6,6+fb);
+    ctx.moveTo(width-6,height-6-fb); ctx.lineTo(width-6,height-6); ctx.lineTo(width-6-fb,height-6);
+    ctx.moveTo(6+fb,height-6); ctx.lineTo(6,height-6); ctx.lineTo(6,height-6-fb);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  if (points.length === 0) return;
+
+  const bs = settings.survBracketSize;
+  const cornerLen = bs * 0.32;
+
+  if (settings.survBrackets) {
+    ctx.strokeStyle = COL;
+    ctx.lineWidth = lw * 1.3;
+    ctx.shadowColor = COL;
+    ctx.shadowBlur = 6;
+    ctx.beginPath();
+    for (const p of points) {
+      const x0 = p.x - bs/2, y0 = p.y - bs/2;
+      const x1 = p.x + bs/2, y1 = p.y + bs/2;
+      ctx.moveTo(x0, y0+cornerLen); ctx.lineTo(x0,y0); ctx.lineTo(x0+cornerLen,y0);
+      ctx.moveTo(x1-cornerLen,y0); ctx.lineTo(x1,y0); ctx.lineTo(x1,y0+cornerLen);
+      ctx.moveTo(x1,y1-cornerLen); ctx.lineTo(x1,y1); ctx.lineTo(x1-cornerLen,y1);
+      ctx.moveTo(x0+cornerLen,y1); ctx.lineTo(x0,y1); ctx.lineTo(x0,y1-cornerLen);
+    }
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+
+  if (settings.survCrosshair) {
+    ctx.strokeStyle = CS + "0.85)";
+    ctx.lineWidth = lw * 0.7;
+    const rs = 12, gap = 3;
+    ctx.beginPath();
+    for (const p of points) {
+      ctx.moveTo(p.x - rs, p.y); ctx.lineTo(p.x - gap, p.y);
+      ctx.moveTo(p.x + gap, p.y); ctx.lineTo(p.x + rs, p.y);
+      ctx.moveTo(p.x, p.y - rs); ctx.lineTo(p.x, p.y - gap);
+      ctx.moveTo(p.x, p.y + gap); ctx.lineTo(p.x, p.y + rs);
+      ctx.moveTo(p.x + 1.6, p.y); ctx.arc(p.x, p.y, 1.6, 0, Math.PI*2);
+    }
+    ctx.stroke();
+  }
+
+  if (settings.survPixelate && frameData) {
+    const gs = Math.max(4, Math.round(bs * 0.13));
+    for (const p of points) {
+      const bx = p.x + bs/2 + 6;
+      const by = p.y - bs/2 - gs*3 - 4;
+      for (let iy = 0; iy < 3; iy++) {
+        for (let ix = 0; ix < 3; ix++) {
+          const sx = p.x + (ix - 1) * 6;
+          const sy = p.y + (iy - 1) * 6;
+          const col = sampleColor(frameData, sx, sy, width);
+          ctx.fillStyle = col;
+          ctx.globalAlpha = 0.9;
+          ctx.fillRect(bx + ix*gs, by + iy*gs, gs, gs);
+        }
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  if (settings.survHud) {
+    ctx.font = monoFont;
+    ctx.fillStyle = COL;
+    ctx.globalAlpha = 0.95;
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      const id = `TGT-${String(i).padStart(3,"0")}`;
+      const coord = `[${String(Math.round(p.x)).padStart(4,"0")},${String(Math.round(p.y)).padStart(4,"0")}]`;
+      const conf = Math.round(58 + (p.intensity||0.5) * 41);
+      ctx.fillText(id, p.x + bs/2 + 6, p.y - bs/2 + fs);
+      ctx.fillStyle = "rgba(255,255,255,0.75)";
+      ctx.fillText(coord, p.x + bs/2 + 6, p.y - bs/2 + fs*2 + 2);
+      ctx.fillStyle = COL;
+      ctx.fillText(`CONF ${conf}%`, p.x - bs/2, p.y + bs/2 + fs + 3);
+    }
+    ctx.globalAlpha = 1;
+  }
+}
+
+/* ─── Mocap Renderer ─── */
+
+function renderMocap(ctx, points, triangles, settings, width, height, frameData) {
+  ctx.clearRect(0, 0, width, height);
+  const lw = settings.mocLineWeight;
+  const PRI = "#ff00cc";
+  const ACC = "#00ffff";
+  const PS = "rgba(255,0,204,";
+  const AS = "rgba(0,255,255,";
+
+  if (settings.mocGrid) {
+    const step = Math.max(28, width / 28);
+    ctx.strokeStyle = AS + "0.05)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let x = step; x < width; x += step) { ctx.moveTo(x, 0); ctx.lineTo(x, height); }
+    for (let y = step; y < height; y += step) { ctx.moveTo(0, y); ctx.lineTo(width, y); }
+    ctx.stroke();
+    ctx.strokeStyle = AS + "0.22)";
+    ctx.beginPath();
+    for (let x = step; x < width; x += step) {
+      for (let y = step; y < height; y += step) {
+        ctx.moveTo(x-3, y); ctx.lineTo(x+3, y);
+        ctx.moveTo(x, y-3); ctx.lineTo(x, y+3);
+      }
+    }
+    ctx.stroke();
+  }
+
+  if (points.length === 0) return;
+
+  if (settings.mocWireframe && triangles.length > 0) {
+    ctx.strokeStyle = AS + "0.35)";
+    ctx.lineWidth = lw * 0.5;
+    ctx.shadowColor = ACC;
+    ctx.shadowBlur = 3;
+    ctx.beginPath();
+    for (const tri of triangles) {
+      ctx.moveTo(tri.a.x, tri.a.y); ctx.lineTo(tri.b.x, tri.b.y);
+      ctx.moveTo(tri.b.x, tri.b.y); ctx.lineTo(tri.c.x, tri.c.y);
+      ctx.moveTo(tri.c.x, tri.c.y); ctx.lineTo(tri.a.x, tri.a.y);
+    }
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+
+  if (settings.mocVectors) {
+    ctx.strokeStyle = PRI;
+    ctx.lineWidth = lw * 0.9;
+    ctx.shadowColor = PRI;
+    ctx.shadowBlur = 5;
+    const vs = settings.mocVectorScale;
+    ctx.beginPath();
+    for (const p of points) {
+      const vx = p.vx || 0, vy = p.vy || 0;
+      const mag = Math.hypot(vx, vy);
+      if (mag < 0.4) continue;
+      const ex = p.x + vx * vs, ey = p.y + vy * vs;
+      ctx.moveTo(p.x, p.y); ctx.lineTo(ex, ey);
+      const ang = Math.atan2(ey - p.y, ex - p.x);
+      const ah = Math.min(9, mag * vs * 0.35);
+      ctx.moveTo(ex, ey);
+      ctx.lineTo(ex - Math.cos(ang - 0.45) * ah, ey - Math.sin(ang - 0.45) * ah);
+      ctx.moveTo(ex, ey);
+      ctx.lineTo(ex - Math.cos(ang + 0.45) * ah, ey - Math.sin(ang + 0.45) * ah);
+    }
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+
+  ctx.shadowColor = ACC;
+  ctx.shadowBlur = 6;
+  for (const p of points) {
+    ctx.fillStyle = ACC;
+    ctx.globalAlpha = 0.95;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 3.2, 0, Math.PI*2);
+    ctx.fill();
+    ctx.strokeStyle = PRI;
+    ctx.lineWidth = lw * 0.9;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 7, 0, Math.PI*2);
+    ctx.stroke();
+  }
+  ctx.shadowBlur = 0;
+  ctx.globalAlpha = 1;
+
+  if (settings.mocRgb && frameData) {
+    const bs = 5;
+    for (const p of points) {
+      const xi = Math.round(p.x), yi = Math.round(p.y);
+      if (xi < 0 || yi < 0 || xi >= width) continue;
+      const i = (yi * width + xi) * 4;
+      if (i < 0 || i >= frameData.length - 3) continue;
+      const r = frameData[i], g = frameData[i+1], b = frameData[i+2];
+      const bx = p.x + 10, by = p.y + 10;
+      ctx.fillStyle = `rgb(${r},0,0)`; ctx.fillRect(bx, by, bs, bs);
+      ctx.fillStyle = `rgb(0,${g},0)`; ctx.fillRect(bx + bs, by, bs, bs);
+      ctx.fillStyle = `rgb(0,0,${b})`; ctx.fillRect(bx + bs*2, by, bs, bs);
+    }
+  }
+
+  if (settings.mocData) {
+    const fs = Math.max(8, Math.round(width / 210));
+    ctx.font = `${fs}px 'Courier New', monospace`;
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      const id = `N${String(i).padStart(3, "0")}`;
+      const v = Math.hypot(p.vx || 0, p.vy || 0);
+      ctx.fillStyle = PRI;
+      ctx.globalAlpha = 0.95;
+      ctx.fillText(id, p.x + 12, p.y - 10);
+      ctx.fillStyle = "rgba(255,255,255,0.7)";
+      ctx.fillText(`x:${String(Math.round(p.x)).padStart(4)} y:${String(Math.round(p.y)).padStart(4)}`, p.x + 12, p.y - 10 + fs + 1);
+      ctx.fillStyle = AS + "0.85)";
+      ctx.fillText(`v:${v.toFixed(1)}`, p.x + 12, p.y - 10 + fs*2 + 2);
+    }
+    ctx.font = `${Math.round(fs*1.35)}px 'Courier New', monospace`;
+    ctx.fillStyle = PRI;
+    ctx.globalAlpha = 0.95;
+    ctx.fillText(`MOCAP_STREAM // ${String(points.length).padStart(2,"0")} NODES`, 10, fs*1.6 + 6);
+    ctx.fillStyle = AS + "0.65)";
+    ctx.fillText(`CHANNEL_XYV`, 10, fs*3 + 8);
+    ctx.globalAlpha = 1;
+  }
+}
+
 /* ─── Delaunay Renderer (existing) ─── */
 
 function renderDelaunay(ctx, points, triangles, trailBuffer, settings, colors, width, height) {
@@ -672,6 +955,9 @@ export default function Tracer() {
   const trailRef = useRef([]);
   const n4tBufferRef = useRef([]);
   const n4tTrackedRef = useRef([]);
+  const survPrevRef = useRef([]);
+  const mocPrevRef = useRef([]);
+  const sessionStartRef = useRef(performance.now());
   const videoAspectRef = useRef(null);
   const resizeFnRef = useRef(null);
   const animRef = useRef(null);
@@ -691,6 +977,8 @@ export default function Tracer() {
   const set = useCallback((key, val) => setSettings(s => ({ ...s, [key]: val })), []);
   const isSkx = settings.renderMode === "skeletrix";
   const isN4t = settings.renderMode === "n4ture";
+  const isSurv = settings.renderMode === "surveil";
+  const isMoc = settings.renderMode === "mocap";
 
   useEffect(() => {
     const c = canvasRef.current, o = overlayRef.current;
@@ -739,6 +1027,8 @@ export default function Tracer() {
       const s = settingsRef.current, col = COLORS[s.colorScheme];
       const skx = s.renderMode === "skeletrix";
       const n4t = s.renderMode === "n4ture";
+      const surv = s.renderMode === "surveil";
+      const moc = s.renderMode === "mocap";
 
       fpsRef.current.frames++;
       if (time - fpsRef.current.last > 1000) { setFps(fpsRef.current.frames); fpsRef.current.frames=0; fpsRef.current.last=time; }
@@ -746,15 +1036,18 @@ export default function Tracer() {
       if (sourceRef.current === "idle") {
         ctx.fillStyle = "#0a0a0a"; ctx.fillRect(0, 0, w, h);
         const pts = generateIdlePoints(time/1000, w, h);
-        const thinned = skx ? thinPoints(pts, s.skxPoints).map((p,i)=>({...p,idx:i}))
-                      : n4t ? thinPoints(pts, s.n4tPoints).map((p,i)=>({...p,idx:i}))
-                      : pts;
+        const targetN = skx ? s.skxPoints : n4t ? s.n4tPoints : surv ? s.survPoints : moc ? s.mocPoints : null;
+        const thinned = targetN ? thinPoints(pts, targetN).map((p,i)=>({...p,idx:i,vx:0,vy:0})) : pts;
         const tris = delaunay(thinned);
         setPointCount(thinned.length); setTriCount(tris.length);
         if (skx) {
           renderSkeletrix(overlayCtx, thinned, tris, s, col, w, h, null);
         } else if (n4t) {
           renderN4ture(overlayCtx, thinned, tris, s, w, h, null);
+        } else if (surv) {
+          renderSurveil(overlayCtx, thinned, s, w, h, null, (time - sessionStartRef.current)/1000);
+        } else if (moc) {
+          renderMocap(overlayCtx, thinned, tris, s, w, h, null);
         } else {
           trailRef.current.push(thinned);
           if (trailRef.current.length > s.trailLength) trailRef.current.shift();
@@ -777,11 +1070,49 @@ export default function Tracer() {
 
         let rawPts = [];
         rawPts = rawPts.concat(detectMotion(gray, prevGrayRef.current, w, h, s.motionThreshold, s.sampleRate));
-        if (s.showEdges && !n4t) rawPts = rawPts.concat(detectEdges(gray, w, h, s.sampleRate));
+        if (s.showEdges && !n4t && !surv && !moc) rawPts = rawPts.concat(detectEdges(gray, w, h, s.sampleRate));
         prevGrayRef.current = gray;
 
         let points;
-        if (n4t) {
+        if (surv || moc) {
+          // Frame-to-frame identity: match this frame's candidates to last frame's
+          // tracked points by nearest neighbor, EMA-smooth position, carry velocity.
+          const thr = surv ? s.survThreshold : s.mocThreshold;
+          const maxP = surv ? s.survPoints : s.mocPoints;
+          let raw = detectMotion(gray, prevGrayRef.current === gray ? null : prevGrayRef.current, w, h, thr, s.sampleRate);
+          raw = raw.concat(detectEdges(gray, w, h, s.sampleRate, thr * 2.2));
+          const fresh = thinPoints(raw, maxP);
+          const prev = surv ? survPrevRef.current : mocPrevRef.current;
+          const matchR = Math.min(w, h) * 0.07;
+          const ema = 0.55;
+          const used = new Set();
+          const out = [];
+          for (let i = 0; i < fresh.length; i++) {
+            const p = fresh[i];
+            let bi = -1, bd = matchR;
+            for (let j = 0; j < prev.length; j++) {
+              if (used.has(j)) continue;
+              const d = Math.hypot(prev[j].x - p.x, prev[j].y - p.y);
+              if (d < bd) { bd = d; bi = j; }
+            }
+            if (bi >= 0) {
+              const q = prev[bi];
+              used.add(bi);
+              const nx = q.x + (p.x - q.x) * ema;
+              const ny = q.y + (p.y - q.y) * ema;
+              const vx = nx - q.x, vy = ny - q.y;
+              out.push({ x: nx, y: ny, vx, vy, intensity: p.intensity, idx: q.idx ?? i, age: (q.age || 0) + 1 });
+            } else {
+              out.push({ x: p.x, y: p.y, vx: 0, vy: 0, intensity: p.intensity, idx: out.length, age: 0 });
+            }
+          }
+          // Reassign compact IDs based on age (oldest first) for stable label numbering
+          out.sort((a, b) => (b.age - a.age) || (b.intensity - a.intensity));
+          for (let i = 0; i < out.length; i++) out[i].idx = i;
+          points = out;
+          if (surv) survPrevRef.current = out;
+          else mocPrevRef.current = out;
+        } else if (n4t) {
           // Same pipeline as Skeletrix: motion + edges → thinPoints.
           // Luminance weight biases the intensity sort toward bright subjects
           // (white flowers, water glints) so they win over dark leaf texture.
@@ -805,6 +1136,10 @@ export default function Tracer() {
           renderSkeletrix(overlayCtx, points, tris, s, col, w, h, frame.data);
         } else if (n4t) {
           renderN4ture(overlayCtx, points, tris, s, w, h, frame.data);
+        } else if (surv) {
+          renderSurveil(overlayCtx, points, s, w, h, frame.data, (time - sessionStartRef.current)/1000);
+        } else if (moc) {
+          renderMocap(overlayCtx, points, tris, s, w, h, frame.data);
         } else {
           trailRef.current.push(points);
           if (trailRef.current.length > s.trailLength) trailRef.current.shift();
@@ -823,7 +1158,7 @@ export default function Tracer() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:1920}, height:{ideal:1080} }, audio:false });
       const v = videoRef.current; v.srcObject=stream; v.muted=true; await v.play();
-      prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[]; n4tTrackedRef.current=[];
+      prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[]; n4tTrackedRef.current=[]; survPrevRef.current=[]; mocPrevRef.current=[]; sessionStartRef.current=performance.now();
       if (v.videoWidth && v.videoHeight) { videoAspectRef.current = v.videoWidth / v.videoHeight; if (resizeFnRef.current) resizeFnRef.current(); }
       setSource("webcam"); setVideoName("Webcam");
     } catch(e) { console.error("Webcam error:", e); }
@@ -835,7 +1170,7 @@ export default function Tracer() {
     const v = videoRef.current;
     if (v.srcObject) { v.srcObject.getTracks().forEach(t=>t.stop()); v.srcObject=null; }
     v.muted=true; v.playsInline=true; v.loop=true; v.preload="auto"; v.src=url;
-    prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[]; n4tTrackedRef.current=[]; setVideoName(file.name);
+    prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[]; n4tTrackedRef.current=[]; survPrevRef.current=[]; mocPrevRef.current=[]; sessionStartRef.current=performance.now(); setVideoName(file.name);
     const onReady = () => {
       v.removeEventListener("canplay",onReady); v.removeEventListener("loadeddata",onReady);
       if (v.videoWidth && v.videoHeight) {
@@ -853,7 +1188,7 @@ export default function Tracer() {
     const v = videoRef.current;
     if (v.srcObject) { v.srcObject.getTracks().forEach(t=>t.stop()); v.srcObject=null; }
     if (v.src) { v.pause(); v.removeAttribute("src"); v.load(); }
-    prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[]; n4tTrackedRef.current=[];
+    prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[]; n4tTrackedRef.current=[]; survPrevRef.current=[]; mocPrevRef.current=[]; sessionStartRef.current=performance.now();
     videoAspectRef.current = null; if (resizeFnRef.current) resizeFnRef.current();
     setSource("idle"); setVideoName("");
   }, []);
@@ -898,7 +1233,7 @@ export default function Tracer() {
           <span style={{ fontSize:9, color:"#555", letterSpacing:2, paddingTop:2 }}>v1.2</span>
         </div>
         <div style={{ display:"flex", alignItems:"center", gap:16, fontSize:10, color:"#555" }}>
-          <span style={{ color: isSkx ? "#ff44ff" : isN4t ? "#44ffaa" : colors.primary, opacity: 0.7 }}>{isSkx ? "SKX" : isN4t ? "N4T" : "DLN"}</span>
+          <span style={{ color: isSkx ? "#ff44ff" : isN4t ? "#44ffaa" : isSurv ? "#ff3838" : isMoc ? "#ff00cc" : colors.primary, opacity: 0.7 }}>{isSkx ? "SKX" : isN4t ? "N4T" : isSurv ? "SRV" : isMoc ? "MOC" : "DLN"}</span>
           <span>{pointCount} PTS</span>
           <span>{triCount} TRI</span>
           <span>{fps} FPS</span>
@@ -939,13 +1274,19 @@ export default function Tracer() {
 
             {/* Render mode toggle */}
             <div style={{ fontSize:10, color:"#555", letterSpacing:3, marginBottom:12 }}>RENDER MODE</div>
-            <div style={{ display:"flex", gap:6, marginBottom:4 }}>
-              {[["delaunay","DELAUNAY"],["skeletrix","SKELETRIX"],["n4ture","N4TURE"]].map(([mode, label]) => (
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:6, marginBottom:4 }}>
+              {[
+                ["delaunay","DELAUNAY", colors.primary, colors.glow],
+                ["skeletrix","SKELETRIX", "#ff44ff", "rgba(255,68,255,0.15)"],
+                ["n4ture","N4TURE", "#44ffaa", "rgba(68,255,170,0.15)"],
+                ["surveil","SURVEIL", "#ff3838", "rgba(255,56,56,0.15)"],
+                ["mocap","MOCAP", "#ff00cc", "rgba(255,0,204,0.15)"],
+              ].map(([mode, label, accent, glow]) => (
                 <button key={mode} onClick={()=>set("renderMode",mode)} style={{
-                  flex:1, padding:"7px 0", fontSize:9, letterSpacing:1, textTransform:"uppercase",
-                  background: settings.renderMode===mode ? (mode==="skeletrix"?"rgba(255,68,255,0.15)":mode==="n4ture"?"rgba(68,255,170,0.15)":colors.glow) : "transparent",
-                  border: `1px solid ${settings.renderMode===mode ? (mode==="skeletrix"?"#ff44ff":mode==="n4ture"?"#44ffaa":colors.primary) : "#333"}`,
-                  color: settings.renderMode===mode ? (mode==="skeletrix"?"#ff44ff":mode==="n4ture"?"#44ffaa":colors.primary) : "#666",
+                  padding:"7px 0", fontSize:9, letterSpacing:1, textTransform:"uppercase",
+                  background: settings.renderMode===mode ? glow : "transparent",
+                  border: `1px solid ${settings.renderMode===mode ? accent : "#333"}`,
+                  color: settings.renderMode===mode ? accent : "#666",
                   fontFamily:"'Courier New',monospace", cursor:"pointer", borderRadius:0,
                 }}>{label}</button>
               ))}
@@ -977,6 +1318,30 @@ export default function Tracer() {
                 <Toggle label="Swatches" value={settings.n4tSwatches} onChange={v=>set("n4tSwatches",v)} color="#44ffaa" />
                 <Toggle label="Labels" value={settings.n4tLabels} onChange={v=>set("n4tLabels",v)} color="#44ffaa" />
                 <Slider label="Line Weight" value={settings.n4tLineWeight} min={0.3} max={8} step={0.1} onChange={v=>set("n4tLineWeight",v)} color="#44ffaa" />
+              </Section>
+            ) : isSurv ? (
+              <Section title="SURVEIL">
+                <Slider label="Targets" value={settings.survPoints} min={4} max={40} step={1} onChange={v=>set("survPoints",v)} color="#ff3838" />
+                <Slider label="Sensitivity" value={settings.survThreshold} min={8} max={60} step={1} onChange={v=>set("survThreshold",v)} color="#ff3838" />
+                <Slider label="Bracket Size" value={settings.survBracketSize} min={16} max={120} step={2} onChange={v=>set("survBracketSize",v)} color="#ff3838" />
+                <Toggle label="Corner Brackets" value={settings.survBrackets} onChange={v=>set("survBrackets",v)} color="#ff3838" />
+                <Toggle label="Crosshair Reticle" value={settings.survCrosshair} onChange={v=>set("survCrosshair",v)} color="#ff3838" />
+                <Toggle label="HUD Overlay" value={settings.survHud} onChange={v=>set("survHud",v)} color="#ff3838" />
+                <Toggle label="Scan Line" value={settings.survScanLine} onChange={v=>set("survScanLine",v)} color="#ff3838" />
+                <Toggle label="Pixel Mosaic" value={settings.survPixelate} onChange={v=>set("survPixelate",v)} color="#ff3838" />
+                <Slider label="Line Weight" value={settings.survLineWeight} min={0.3} max={5} step={0.1} onChange={v=>set("survLineWeight",v)} color="#ff3838" />
+              </Section>
+            ) : isMoc ? (
+              <Section title="MOCAP">
+                <Slider label="Nodes" value={settings.mocPoints} min={8} max={120} step={1} onChange={v=>set("mocPoints",v)} color="#ff00cc" />
+                <Slider label="Sensitivity" value={settings.mocThreshold} min={5} max={50} step={1} onChange={v=>set("mocThreshold",v)} color="#ff00cc" />
+                <Slider label="Vector Scale" value={settings.mocVectorScale} min={1} max={20} step={0.5} onChange={v=>set("mocVectorScale",v)} color="#ff00cc" />
+                <Toggle label="Velocity Vectors" value={settings.mocVectors} onChange={v=>set("mocVectors",v)} color="#ff00cc" />
+                <Toggle label="Wireframe" value={settings.mocWireframe} onChange={v=>set("mocWireframe",v)} color="#ff00cc" />
+                <Toggle label="TD Grid" value={settings.mocGrid} onChange={v=>set("mocGrid",v)} color="#ff00cc" />
+                <Toggle label="Data Readouts" value={settings.mocData} onChange={v=>set("mocData",v)} color="#ff00cc" />
+                <Toggle label="RGB Sampling" value={settings.mocRgb} onChange={v=>set("mocRgb",v)} color="#ff00cc" />
+                <Slider label="Line Weight" value={settings.mocLineWeight} min={0.3} max={5} step={0.1} onChange={v=>set("mocLineWeight",v)} color="#ff00cc" />
               </Section>
             ) : (
               <>
