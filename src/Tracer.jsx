@@ -875,6 +875,7 @@ export default function Tracer() {
   const settingsRef = useRef(settings);
   const sourceRef = useRef(source);
   const fileInputRef = useRef(null);
+  const facingRef = useRef("environment");
 
   useEffect(() => { settingsRef.current = settings; }, [settings]);
   useEffect(() => { sourceRef.current = source; }, [source]);
@@ -1027,15 +1028,23 @@ export default function Tracer() {
     return () => { running=false; cancelAnimationFrame(animRef.current); };
   }, []);
 
-  const startWebcam = useCallback(async () => {
+  const startWebcam = useCallback(async (facing) => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ideal:"environment"}, width:{ideal:1280}, height:{ideal:720} }, audio:false });
-      const v = videoRef.current; v.srcObject=stream; v.muted=true; await v.play();
+      const mode = typeof facing === "string" ? facing : facingRef.current;
+      const v = videoRef.current;
+      if (v.srcObject) { v.srcObject.getTracks().forEach(t=>t.stop()); v.srcObject=null; }
+      const stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ideal:mode}, width:{ideal:1280}, height:{ideal:720} }, audio:false });
+      facingRef.current = mode;
+      v.srcObject=stream; v.muted=true; await v.play();
       prevGrayRef.current=null; trackerRef.current={points:[],nextId:1}; sessionStartRef.current=performance.now();
       if (v.videoWidth && v.videoHeight) { videoAspectRef.current = v.videoWidth / v.videoHeight; if (resizeFnRef.current) resizeFnRef.current(); }
-      setSource("webcam"); setVideoName("Webcam");
+      setSource("webcam"); setVideoName(mode === "environment" ? "Webcam (rear)" : "Webcam (front)");
     } catch(e) { console.error("Webcam error:", e); }
   }, []);
+
+  const flipCamera = useCallback(() => {
+    startWebcam(facingRef.current === "environment" ? "user" : "environment");
+  }, [startWebcam]);
 
   const loadVideo = useCallback((file) => {
     setLoading(true);
@@ -1123,6 +1132,14 @@ export default function Tracer() {
           <video ref={videoRef} style={{ display:"none" }} playsInline muted />
           <canvas ref={canvasRef} style={{ position:"absolute", inset:0, width:"100%", height:"100%" }} />
           <canvas ref={overlayRef} style={{ position:"absolute", inset:0, width:"100%", height:"100%", pointerEvents:"none" }} />
+          {source==="webcam" && (
+            <button onClick={flipCamera} aria-label="Flip camera" style={{
+              position:"absolute", bottom:16, right:16, zIndex:6,
+              width:44, height:44, background:"rgba(13,13,13,0.75)", border:`1px solid ${colors.secondary}`,
+              color:colors.primary, fontSize:20, lineHeight:"40px", textAlign:"center",
+              cursor:"pointer", borderRadius:0, fontFamily:"'Courier New',monospace",
+            }}>⟲</button>
+          )}
           {(source==="idle"||loading) && (
             <div style={{ position:"absolute", inset:0, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:16, zIndex:5 }}>
               {loading ? (
@@ -1271,6 +1288,13 @@ export default function Tracer() {
                   }}>■ Stop & Save</button>
                 )}
               </div>
+              {source==="webcam" && (
+                <button onClick={flipCamera} style={{
+                  width:"100%", padding:"8px 0", fontSize:10, letterSpacing:2, textTransform:"uppercase", marginTop:8,
+                  background:"transparent", border:`1px solid ${colors.secondary}`, color:colors.primary,
+                  fontFamily:"'Courier New',monospace", cursor:"pointer", borderRadius:0,
+                }}>⟲ Flip Camera</button>
+              )}
               {source!=="idle" && (
                 <button onClick={stopSource} style={{
                   width:"100%", padding:"8px 0", fontSize:10, letterSpacing:2, textTransform:"uppercase", marginTop:8,
