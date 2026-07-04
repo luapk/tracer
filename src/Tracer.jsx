@@ -496,9 +496,6 @@ function renderN4ture(ctx, points, triangles, settings, width, height, frameData
         ctx.fillStyle = col;
         drawDiamond(lx + dr, ly, dr);
         ctx.fill();
-        ctx.strokeStyle = N4S + "0.85)";
-        ctx.lineWidth = 1;
-        ctx.stroke();
       }
       ctx.globalAlpha = 0.85;
       ctx.fillStyle = N4C;
