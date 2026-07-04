@@ -1,8 +1,9 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 
 /* ═══════════════════════════════════════════════════
-   TRACER v1.2 — Motion Tracking Overlay Engine
-   Delaunay + Skeletrix + N4ture render modes
+   TRACER v1.3 — Motion Tracking Overlay Engine
+   Skeletrix + N4ture + Surveil + Mocap render modes
+   Patch-based optical-flow tracker, mobile-optimised
    ═══════════════════════════════════════════════════ */
 
 const COLORS = {
@@ -14,24 +15,13 @@ const COLORS = {
 };
 
 const DEFAULTS = {
-  renderMode: "delaunay",
+  renderMode: "skeletrix",
   colorScheme: "cyan",
-  trailLength: 25,
-  trailDecay: 0.92,
   lineWeight: 1.0,
-  glowIntensity: 12,
-  pointSize: 2.5,
-  showMesh: true,
-  showTrails: true,
-  showLabels: false,
-  showEdges: true,
-  showPoints: true,
   background: "dimmed",
-  motionThreshold: 35,
-  sampleRate: 5,
+  motionThreshold: 18,
+  sampleRate: 4,
   dimAmount: 0.75,
-  maxPoints: 120,
-  triangleFill: 0.06,
   // Skeletrix
   skxPoints: 22,
   skxSwatchSize: 18,
@@ -41,7 +31,6 @@ const DEFAULTS = {
   // N4ture
   n4tPoints: 30,
   n4tThreshold: 12,
-  n4tSmooth: 4,
   n4tFlowLines: true,
   n4tSwatches: true,
   n4tLabels: true,
@@ -118,82 +107,93 @@ function getGrayscale(data, w, h) {
   return g;
 }
 
-function detectMotion(curr, prev, w, h, threshold, step) {
-  const pts = [];
-  if (!prev) return pts;
-  for (let y = step; y < h-step; y += step)
-    for (let x = step; x < w-step; x += step) {
-      const diff = Math.abs(curr[y*w+x] - prev[y*w+x]);
-      if (diff > threshold) pts.push({ x, y, intensity: Math.min(diff/120, 1), type: "motion" });
-    }
-  return pts;
-}
+/* ─── Optical-flow point tracker ───
+   Real frame-to-frame motion lock: each tracked point block-matches its
+   7x7 grayscale patch from the previous frame against a search window
+   around its velocity-predicted position (SAD minimisation). Points coast
+   on their velocity through brief occlusion and are culled after repeated
+   misses. New points seed on moving, textured spots with min spacing.
+   Runs on a downscaled processing frame so it is cheap on mobile. */
 
-function detectEdges(gray, w, h, step, threshold = 80) {
-  const pts = [];
-  for (let y = step; y < h-step; y += step*2)
-    for (let x = step; x < w-step; x += step*2) {
-      const i = y*w+x;
-      const gx = -gray[i-w-1]+gray[i-w+1]-2*gray[i-1]+2*gray[i+1]-gray[i+w-1]+gray[i+w+1];
-      const gy = -gray[i-w-1]-2*gray[i-w]-gray[i-w+1]+gray[i+w-1]+2*gray[i+w]+gray[i+w+1];
-      const mag = Math.sqrt(gx*gx+gy*gy);
-      if (mag > threshold) pts.push({ x, y, intensity: Math.min(mag/300, 1), type: "edge" });
-    }
-  return pts;
-}
+const TRK = { PATCH: 3, SEARCH: 6, MAX_MISS: 6, SAD_LOST: 26 };
 
-// Spatially-distributed feature detector: grid NMS keeps top features per cell
-// so points cover the whole frame instead of clustering on the densest region.
-function detectFeatures(gray, w, h, step, threshold, gridX, gridY) {
-  const cellW = w / gridX, cellH = h / gridY;
-  const cells = [];
-  for (let i = 0; i < gridX * gridY; i++) cells.push([]);
-  for (let y = step*2; y < h-step*2; y += step) {
-    for (let x = step*2; x < w-step*2; x += step) {
-      const i = y*w+x;
-      const gx = -gray[i-w-1]+gray[i-w+1]-2*gray[i-1]+2*gray[i+1]-gray[i+w-1]+gray[i+w+1];
-      const gy = -gray[i-w-1]-2*gray[i-w]-gray[i-w+1]+gray[i+w-1]+2*gray[i+w]+gray[i+w+1];
-      const mag = Math.sqrt(gx*gx+gy*gy);
-      if (mag < threshold) continue;
-      // Bias toward bright features (white flowers, water glints) and away from mid-grey leaf texture
-      const bright = gray[i] / 255;
-      const score = mag * (0.45 + bright * 0.85);
-      const cx = Math.min(gridX-1, Math.floor(x / cellW));
-      const cy = Math.min(gridY-1, Math.floor(y / cellH));
-      cells[cy*gridX + cx].push({ x, y, score, intensity: Math.min(mag/300, 1) });
+function trackerUpdate(state, prev, curr, w, h, opts) {
+  const P = TRK.PATCH, S = TRK.SEARCH, margin = P + S + 1;
+  const side = P * 2 + 1, area = side * side;
+
+  if (prev) {
+    for (const tp of state.points) {
+      const px = Math.round(tp.x), py = Math.round(tp.y);
+      if (px < P || py < P || px >= w - P || py >= h - P) { tp.missed = TRK.MAX_MISS; continue; }
+      // Search around the velocity-predicted position
+      let cx = Math.round(tp.x + tp.vx), cy = Math.round(tp.y + tp.vy);
+      cx = Math.max(margin, Math.min(w - margin, cx));
+      cy = Math.max(margin, Math.min(h - margin, cy));
+      let best = Infinity, bx = cx, by = cy;
+      for (let dy = -S; dy <= S; dy++) {
+        for (let dx = -S; dx <= S; dx++) {
+          const nx = cx + dx, ny = cy + dy;
+          let sad = 0;
+          for (let oy = -P; oy <= P; oy++) {
+            const rp = (py + oy) * w + px, rc = (ny + oy) * w + nx;
+            for (let ox = -P; ox <= P; ox++) sad += Math.abs(prev[rp + ox] - curr[rc + ox]);
+          }
+          if (sad < best) { best = sad; bx = nx; by = ny; }
+        }
+      }
+      if (best / area < TRK.SAD_LOST) {
+        tp.vx = tp.vx * 0.4 + (bx - tp.x) * 0.6;
+        tp.vy = tp.vy * 0.4 + (by - tp.y) * 0.6;
+        tp.x = bx; tp.y = by;
+        tp.age++; tp.missed = 0;
+      } else {
+        tp.missed++;
+        tp.x += tp.vx; tp.y += tp.vy;
+      }
+      if (tp.x < margin || tp.y < margin || tp.x > w - margin || tp.y > h - margin) tp.missed = TRK.MAX_MISS;
+    }
+    state.points = state.points.filter(p => p.missed < TRK.MAX_MISS);
+  }
+
+  // Seed new points: moving (or, on the first frame, textured) spots, spaced out
+  if (state.points.length < opts.maxPoints) {
+    const cand = [];
+    const step = Math.max(2, opts.step);
+    for (let y = margin; y < h - margin; y += step) {
+      for (let x = margin; x < w - margin; x += step) {
+        const i = y * w + x;
+        const motion = prev ? Math.abs(curr[i] - prev[i]) : 0;
+        if (prev && motion < opts.threshold) continue;
+        const gx = curr[i + 1] - curr[i - 1], gy = curr[i + w] - curr[i - w];
+        const tex = Math.abs(gx) + Math.abs(gy);
+        if (tex < 10) continue; // untextured patches can't be tracked
+        let score = (motion + 8) * (tex + 4);
+        if (opts.lumBias) { const l = curr[i] / 255; score *= 0.25 + 0.75 * l * l; }
+        cand.push({ x, y, score, intensity: Math.min(1, motion / 60 + 0.3) });
+      }
+    }
+    cand.sort((a, b) => b.score - a.score);
+    const minDist = Math.max(10, Math.min(w, h) * 0.055);
+    const md2 = minDist * minDist;
+    for (const c of cand) {
+      if (state.points.length >= opts.maxPoints) break;
+      let clash = false;
+      for (const tp of state.points) {
+        const ddx = tp.x - c.x, ddy = tp.y - c.y;
+        if (ddx * ddx + ddy * ddy < md2) { clash = true; break; }
+      }
+      if (!clash) state.points.push({ x: c.x, y: c.y, vx: 0, vy: 0, age: 0, missed: 0, intensity: c.intensity, id: state.nextId++ });
     }
   }
-  const result = [];
-  for (const cell of cells) {
-    if (cell.length === 0) continue;
-    cell.sort((a, b) => b.score - a.score);
-    const take = Math.min(4, cell.length);
-    for (let k = 0; k < take; k++) result.push(cell[k]);
-  }
-  return result;
-}
 
-// Sub-pixel-ish local refinement: snap a tracked point to the strongest scored
-// edge within a small search window. Gives high-precision lock onto a moving shape.
-function refineToEdge(gray, w, h, x, y, searchR) {
-  const xi = Math.round(x), yi = Math.round(y);
-  let bestX = xi, bestY = yi, bestScore = 0;
-  for (let dy = -searchR; dy <= searchR; dy++) {
-    const ny = yi + dy;
-    if (ny < 1 || ny >= h - 1) continue;
-    for (let dx = -searchR; dx <= searchR; dx++) {
-      const nx = xi + dx;
-      if (nx < 1 || nx >= w - 1) continue;
-      const i = ny*w + nx;
-      const gx = -gray[i-w-1]+gray[i-w+1]-2*gray[i-1]+2*gray[i+1]-gray[i+w-1]+gray[i+w+1];
-      const gy = -gray[i-w-1]-2*gray[i-w]-gray[i-w+1]+gray[i+w-1]+2*gray[i+w]+gray[i+w+1];
-      const mag = Math.sqrt(gx*gx + gy*gy);
-      const bright = gray[i] / 255;
-      const score = mag * (0.45 + bright * 0.85);
-      if (score > bestScore) { bestScore = score; bestX = nx; bestY = ny; }
+  // Live intensity for renderers: local motion + speed
+  if (prev) {
+    for (const tp of state.points) {
+      const i = Math.round(tp.y) * w + Math.round(tp.x);
+      if (i >= 0 && i < curr.length)
+        tp.intensity = Math.min(1, Math.abs(curr[i] - prev[i]) / 50 + Math.hypot(tp.vx, tp.vy) / 6 + 0.25);
     }
   }
-  return { x: bestX, y: bestY, score: bestScore };
 }
 
 function thinPoints(points, maxCount) {
@@ -205,14 +205,21 @@ function thinPoints(points, maxCount) {
   return res;
 }
 
-/* ─── Sample pixel color from frame data ─── */
+/* ─── Sample pixel color from the (downscaled) processing frame ───
+   frame = { data, w, h, scale } where scale maps display coords → frame coords */
 
-function sampleColor(frameData, x, y, w) {
-  const px = Math.round(x), py = Math.round(y);
-  if (px < 0 || py < 0 || px >= w) return "rgba(180,180,180,0.6)";
-  const i = (py * w + px) * 4;
-  if (i < 0 || i+2 >= frameData.length) return "rgba(180,180,180,0.6)";
-  return `rgb(${frameData[i]},${frameData[i+1]},${frameData[i+2]})`;
+function samplePixel(frame, x, y) {
+  if (!frame) return null;
+  const px = Math.round(x * frame.scale), py = Math.round(y * frame.scale);
+  if (px < 0 || py < 0 || px >= frame.w) return null;
+  const i = (py * frame.w + px) * 4;
+  if (i < 0 || i + 2 >= frame.data.length) return null;
+  return [frame.data[i], frame.data[i + 1], frame.data[i + 2]];
+}
+
+function sampleColor(frame, x, y) {
+  const p = samplePixel(frame, x, y);
+  return p ? `rgb(${p[0]},${p[1]},${p[2]})` : "rgba(180,180,180,0.6)";
 }
 
 /* ─── Extend a line from p through q to the canvas edge ─── */
@@ -230,7 +237,7 @@ function extendToEdge(px, py, qx, qy, w, h) {
 
 /* ─── Skeletrix Renderer ─── */
 
-function renderSkeletrix(ctx, points, triangles, settings, colors, width, height, frameData) {
+function renderSkeletrix(ctx, points, triangles, settings, colors, width, height, frame) {
   ctx.clearRect(0, 0, width, height);
   if (points.length === 0) return;
 
@@ -284,10 +291,10 @@ function renderSkeletrix(ctx, points, triangles, settings, colors, width, height
   }
 
   // 3. Colour-sampled swatches at vertices
-  if (frameData) {
+  if (frame) {
     const sw = settings.skxSwatchSize;
     for (const p of points) {
-      const col = sampleColor(frameData, p.x, p.y, width);
+      const col = sampleColor(frame, p.x, p.y);
       ctx.globalAlpha = 0.65;
       ctx.fillStyle = col;
       // Offset the swatch slightly so it doesn't cover the vertex
@@ -355,7 +362,7 @@ function renderSkeletrix(ctx, points, triangles, settings, colors, width, height
 
 /* ─── N4ture Renderer ─── */
 
-function renderN4ture(ctx, points, triangles, settings, width, height, frameData) {
+function renderN4ture(ctx, points, triangles, settings, width, height, frame) {
   ctx.clearRect(0, 0, width, height);
   if (points.length === 0) return;
 
@@ -435,10 +442,10 @@ function renderN4ture(ctx, points, triangles, settings, width, height, frameData
   }
 
   // 3. Diamond colour swatches — sampled pixel colour at each tracked point, offset outward
-  if (frameData && settings.n4tSwatches) {
+  if (frame && settings.n4tSwatches) {
     const r = settings.n4tOrganicRadius;
     for (const p of points) {
-      const col = sampleColor(frameData, p.x, p.y, width);
+      const col = sampleColor(frame, p.x, p.y);
       const angle = Math.atan2(p.y - height / 2, p.x - width / 2);
       const ox = Math.cos(angle + Math.PI) * (r * 2.0);
       const oy = Math.sin(angle + Math.PI) * (r * 2.0);
@@ -510,8 +517,8 @@ function renderN4ture(ctx, points, triangles, settings, width, height, frameData
       const p = points[i];
       const lx = p.x + ms + 6;
       const ly = p.y;
-      if (frameData) {
-        const col = sampleColor(frameData, p.x, p.y, width);
+      if (frame) {
+        const col = sampleColor(frame, p.x, p.y);
         ctx.globalAlpha = 0.9;
         ctx.fillStyle = col;
         drawDiamond(lx + dr, ly, dr);
@@ -527,7 +534,7 @@ function renderN4ture(ctx, points, triangles, settings, width, height, frameData
 
 /* ─── Surveil Renderer ─── */
 
-function renderSurveil(ctx, points, settings, width, height, frameData, elapsed) {
+function renderSurveil(ctx, points, settings, width, height, frame, elapsed) {
   ctx.clearRect(0, 0, width, height);
   const lw = settings.survLineWeight;
   const COL = "#ff3838";
@@ -623,7 +630,7 @@ function renderSurveil(ctx, points, settings, width, height, frameData, elapsed)
     ctx.stroke();
   }
 
-  if (settings.survPixelate && frameData) {
+  if (settings.survPixelate && frame) {
     const gs = Math.max(4, Math.round(bs * 0.13));
     for (const p of points) {
       const bx = p.x + bs/2 + 6;
@@ -632,7 +639,7 @@ function renderSurveil(ctx, points, settings, width, height, frameData, elapsed)
         for (let ix = 0; ix < 3; ix++) {
           const sx = p.x + (ix - 1) * 6;
           const sy = p.y + (iy - 1) * 6;
-          const col = sampleColor(frameData, sx, sy, width);
+          const col = sampleColor(frame, sx, sy);
           ctx.fillStyle = col;
           ctx.globalAlpha = 0.9;
           ctx.fillRect(bx + ix*gs, by + iy*gs, gs, gs);
@@ -663,7 +670,7 @@ function renderSurveil(ctx, points, settings, width, height, frameData, elapsed)
 
 /* ─── Mocap Renderer ─── */
 
-function renderMocap(ctx, points, triangles, settings, width, height, frameData) {
+function renderMocap(ctx, points, triangles, settings, width, height, frame) {
   ctx.clearRect(0, 0, width, height);
   const lw = settings.mocLineWeight;
   const PRI = "#ff00cc";
@@ -748,14 +755,12 @@ function renderMocap(ctx, points, triangles, settings, width, height, frameData)
   ctx.shadowBlur = 0;
   ctx.globalAlpha = 1;
 
-  if (settings.mocRgb && frameData) {
+  if (settings.mocRgb && frame) {
     const bs = 5;
     for (const p of points) {
-      const xi = Math.round(p.x), yi = Math.round(p.y);
-      if (xi < 0 || yi < 0 || xi >= width) continue;
-      const i = (yi * width + xi) * 4;
-      if (i < 0 || i >= frameData.length - 3) continue;
-      const r = frameData[i], g = frameData[i+1], b = frameData[i+2];
+      const px = samplePixel(frame, p.x, p.y);
+      if (!px) continue;
+      const [r, g, b] = px;
       const bx = p.x + 10, by = p.y + 10;
       ctx.fillStyle = `rgb(${r},0,0)`; ctx.fillRect(bx, by, bs, bs);
       ctx.fillStyle = `rgb(0,${g},0)`; ctx.fillRect(bx + bs, by, bs, bs);
@@ -784,103 +789,6 @@ function renderMocap(ctx, points, triangles, settings, width, height, frameData)
     ctx.fillText(`MOCAP_STREAM // ${String(points.length).padStart(2,"0")} NODES`, 10, fs*1.6 + 6);
     ctx.fillStyle = AS + "0.65)";
     ctx.fillText(`CHANNEL_XYV`, 10, fs*3 + 8);
-    ctx.globalAlpha = 1;
-  }
-}
-
-/* ─── Delaunay Renderer (existing) ─── */
-
-function renderDelaunay(ctx, points, triangles, trailBuffer, settings, colors, width, height) {
-  ctx.clearRect(0, 0, width, height);
-
-  if (settings.showMesh && triangles.length > 0) {
-    ctx.shadowColor = colors.primary;
-    ctx.shadowBlur = settings.glowIntensity * 0.5;
-    if (settings.triangleFill > 0) {
-      for (const tri of triangles) {
-        const avgI = (tri.a.intensity + tri.b.intensity + tri.c.intensity) / 3;
-        ctx.globalAlpha = settings.triangleFill * (0.3 + avgI * 0.7);
-        ctx.fillStyle = colors.primary;
-        ctx.beginPath();
-        ctx.moveTo(tri.a.x, tri.a.y); ctx.lineTo(tri.b.x, tri.b.y); ctx.lineTo(tri.c.x, tri.c.y);
-        ctx.closePath(); ctx.fill();
-      }
-    }
-    ctx.strokeStyle = colors.primary;
-    ctx.lineWidth = settings.lineWeight;
-    ctx.globalAlpha = 0.5;
-    ctx.shadowBlur = settings.glowIntensity * 0.7;
-    ctx.beginPath();
-    for (const tri of triangles) {
-      ctx.moveTo(tri.a.x, tri.a.y); ctx.lineTo(tri.b.x, tri.b.y); ctx.lineTo(tri.c.x, tri.c.y); ctx.closePath();
-    }
-    ctx.stroke();
-    ctx.strokeStyle = colors.secondary;
-    ctx.lineWidth = settings.lineWeight * 0.35;
-    ctx.globalAlpha = 0.12;
-    ctx.shadowBlur = settings.glowIntensity * 0.3;
-    ctx.beginPath();
-    for (const tri of triangles) {
-      const cx = (tri.a.x+tri.b.x+tri.c.x)/3, cy = (tri.a.y+tri.b.y+tri.c.y)/3;
-      ctx.moveTo(cx,cy); ctx.lineTo(tri.a.x,tri.a.y);
-      ctx.moveTo(cx,cy); ctx.lineTo(tri.b.x,tri.b.y);
-      ctx.moveTo(cx,cy); ctx.lineTo(tri.c.x,tri.c.y);
-    }
-    ctx.stroke();
-    ctx.globalAlpha = 1;
-  }
-
-  if (settings.showTrails && trailBuffer.length > 1) {
-    ctx.shadowColor = colors.primary;
-    ctx.shadowBlur = settings.glowIntensity * 0.6;
-    ctx.lineWidth = settings.lineWeight * 0.8;
-    for (let t = 1; t < trailBuffer.length; t++) {
-      const age = trailBuffer.length - t;
-      const alpha = Math.pow(settings.trailDecay, age) * 0.5;
-      if (alpha < 0.02) continue;
-      ctx.strokeStyle = colors.primary;
-      ctx.globalAlpha = alpha;
-      const prev = trailBuffer[t-1], curr = trailBuffer[t];
-      if (!prev.length || !curr.length) continue;
-      ctx.beginPath();
-      const step = Math.max(1, Math.floor(curr.length / 60));
-      for (let i = 0; i < curr.length; i += step) {
-        const p = curr[i];
-        let closest = null, cd = 1200;
-        for (let j = 0; j < prev.length; j += step) {
-          const dx = p.x-prev[j].x, dy = p.y-prev[j].y, d = dx*dx+dy*dy;
-          if (d < cd) { cd = d; closest = prev[j]; }
-        }
-        if (closest) { ctx.moveTo(closest.x, closest.y); ctx.lineTo(p.x, p.y); }
-      }
-      ctx.stroke();
-    }
-    ctx.globalAlpha = 1;
-  }
-
-  if (settings.showPoints) {
-    ctx.shadowColor = colors.primary;
-    ctx.shadowBlur = settings.glowIntensity;
-    ctx.fillStyle = colors.primary;
-    for (const p of points) {
-      ctx.globalAlpha = 0.5 + p.intensity * 0.5;
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, settings.pointSize * (0.6 + p.intensity*0.6), 0, Math.PI*2);
-      ctx.fill();
-    }
-    ctx.globalAlpha = 1;
-  }
-
-  if (settings.showLabels && points.length > 0) {
-    ctx.shadowBlur = 0;
-    ctx.font = `${Math.max(8, Math.round(width/140))}px 'Courier New', monospace`;
-    ctx.fillStyle = colors.text;
-    ctx.globalAlpha = 0.6;
-    const ls = Math.max(1, Math.floor(points.length / 18));
-    for (let i = 0; i < points.length; i += ls) {
-      const p = points[i];
-      ctx.fillText(`${(p.x/width).toFixed(3)}, ${(p.y/height).toFixed(3)}`, p.x+6, p.y-4);
-    }
     ctx.globalAlpha = 1;
   }
 }
@@ -946,17 +854,16 @@ export default function Tracer() {
   const [triCount, setTriCount] = useState(0);
   const [videoName, setVideoName] = useState("");
   const [loading, setLoading] = useState(false);
+  const [isMobile, setIsMobile] = useState(typeof window !== "undefined" && window.innerWidth < 640);
 
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const overlayRef = useRef(null);
   const offscreenRef = useRef(null);
   const prevGrayRef = useRef(null);
-  const trailRef = useRef([]);
-  const n4tBufferRef = useRef([]);
-  const n4tTrackedRef = useRef([]);
-  const survPrevRef = useRef([]);
-  const mocPrevRef = useRef([]);
+  const trackerRef = useRef({ points: [], nextId: 1 });
+  const lastModeRef = useRef(null);
+  const sizeRef = useRef({ w: 0, h: 0, dpr: 1 });
   const sessionStartRef = useRef(performance.now());
   const videoAspectRef = useRef(null);
   const resizeFnRef = useRef(null);
@@ -971,6 +878,12 @@ export default function Tracer() {
 
   useEffect(() => { settingsRef.current = settings; }, [settings]);
   useEffect(() => { sourceRef.current = source; }, [source]);
+  useEffect(() => {
+    const onR = () => setIsMobile(window.innerWidth < 640);
+    window.addEventListener("resize", onR);
+    return () => window.removeEventListener("resize", onR);
+  }, []);
+  useEffect(() => { if (resizeFnRef.current) resizeFnRef.current(); }, [sidebarOpen, isMobile]);
   useEffect(() => { if (videoRef.current) { videoRef.current.muted = true; videoRef.current.playsInline = true; } }, []);
 
   const colors = COLORS[settings.colorScheme];
@@ -978,7 +891,6 @@ export default function Tracer() {
   const isSkx = settings.renderMode === "skeletrix";
   const isN4t = settings.renderMode === "n4ture";
   const isSurv = settings.renderMode === "surveil";
-  const isMoc = settings.renderMode === "mocap";
 
   useEffect(() => {
     const c = canvasRef.current, o = overlayRef.current;
@@ -999,14 +911,20 @@ export default function Tracer() {
       } else {
         w = containerW; h = containerH; left = 0; top = 0;
       }
-      c.width = w; c.height = h; o.width = w; o.height = h;
+      // DPR-aware backing store for crisp lines on mobile/retina; renderers draw in CSS px
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      c.width = w * dpr; c.height = h * dpr; o.width = w * dpr; o.height = h * dpr;
+      sizeRef.current = { w, h, dpr };
       [c, o].forEach(el => {
         el.style.width = w + "px"; el.style.height = h + "px";
         el.style.left = left + "px"; el.style.top = top + "px";
         el.style.right = "auto"; el.style.bottom = "auto";
       });
+      // Processing canvas is capped small — detection cost is what kills mobile
       if (!offscreenRef.current) offscreenRef.current = document.createElement("canvas");
-      offscreenRef.current.width = w; offscreenRef.current.height = h;
+      const pw = Math.min(384, Math.max(2, w));
+      const ph = Math.max(2, Math.round(pw * h / Math.max(1, w)));
+      offscreenRef.current.width = pw; offscreenRef.current.height = ph;
     };
     resizeFnRef.current = resize;
     resize();
@@ -1023,12 +941,22 @@ export default function Tracer() {
       const c = canvasRef.current, o = overlayRef.current, v = videoRef.current;
       if (!c || !o) return;
       const ctx = c.getContext("2d"), overlayCtx = o.getContext("2d");
-      const w = c.width, h = c.height;
+      const { w, h, dpr } = sizeRef.current;
+      if (!w || !h) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
       const s = settingsRef.current, col = COLORS[s.colorScheme];
       const skx = s.renderMode === "skeletrix";
       const n4t = s.renderMode === "n4ture";
       const surv = s.renderMode === "surveil";
       const moc = s.renderMode === "mocap";
+
+      // Fresh tracker when the mode changes (each mode has its own point budget)
+      if (lastModeRef.current !== s.renderMode) {
+        lastModeRef.current = s.renderMode;
+        trackerRef.current = { points: [], nextId: 1 };
+        prevGrayRef.current = null;
+      }
 
       fpsRef.current.frames++;
       if (time - fpsRef.current.last > 1000) { setFps(fpsRef.current.frames); fpsRef.current.frames=0; fpsRef.current.last=time; }
@@ -1036,115 +964,60 @@ export default function Tracer() {
       if (sourceRef.current === "idle") {
         ctx.fillStyle = "#0a0a0a"; ctx.fillRect(0, 0, w, h);
         const pts = generateIdlePoints(time/1000, w, h);
-        const targetN = skx ? s.skxPoints : n4t ? s.n4tPoints : surv ? s.survPoints : moc ? s.mocPoints : null;
-        const thinned = targetN ? thinPoints(pts, targetN).map((p,i)=>({...p,idx:i,vx:0,vy:0})) : pts;
+        const targetN = skx ? s.skxPoints : n4t ? s.n4tPoints : surv ? s.survPoints : s.mocPoints;
+        const thinned = thinPoints(pts, targetN).map((p,i)=>({...p,idx:i,vx:0,vy:0}));
         const tris = delaunay(thinned);
         setPointCount(thinned.length); setTriCount(tris.length);
-        if (skx) {
-          renderSkeletrix(overlayCtx, thinned, tris, s, col, w, h, null);
-        } else if (n4t) {
-          renderN4ture(overlayCtx, thinned, tris, s, w, h, null);
-        } else if (surv) {
-          renderSurveil(overlayCtx, thinned, s, w, h, null, (time - sessionStartRef.current)/1000);
-        } else if (moc) {
-          renderMocap(overlayCtx, thinned, tris, s, w, h, null);
-        } else {
-          trailRef.current.push(thinned);
-          if (trailRef.current.length > s.trailLength) trailRef.current.shift();
-          renderDelaunay(overlayCtx, thinned, tris, trailRef.current, s, col, w, h);
-        }
+        if (skx) renderSkeletrix(overlayCtx, thinned, tris, s, col, w, h, null);
+        else if (n4t) renderN4ture(overlayCtx, thinned, tris, s, w, h, null);
+        else if (surv) renderSurveil(overlayCtx, thinned, s, w, h, null, (time - sessionStartRef.current)/1000);
+        else renderMocap(overlayCtx, thinned, tris, s, w, h, null);
         return;
       }
 
       if (v && v.readyState >= 2 && v.videoWidth > 0) {
         const off = offscreenRef.current;
         if (!off) return;
+        const pw = off.width, ph = off.height;
         const offCtx = off.getContext("2d", { willReadFrequently: true });
-        offCtx.drawImage(v, 0, 0, w, h);
-        const frame = offCtx.getImageData(0, 0, w, h);
-        const gray = getGrayscale(frame.data, w, h);
+        offCtx.drawImage(v, 0, 0, pw, ph);
+        const img = offCtx.getImageData(0, 0, pw, ph);
+        const gray = getGrayscale(img.data, pw, ph);
+        const scale = w / pw;
+        const frame = { data: img.data, w: pw, h: ph, scale: 1 / scale };
 
         if (s.background === "black") { ctx.fillStyle="#0a0a0a"; ctx.fillRect(0,0,w,h); }
         else if (s.background === "dimmed") { ctx.drawImage(v,0,0,w,h); ctx.fillStyle=`rgba(0,0,0,${s.dimAmount})`; ctx.fillRect(0,0,w,h); }
         else ctx.drawImage(v, 0, 0, w, h);
 
-        let rawPts = [];
-        rawPts = rawPts.concat(detectMotion(gray, prevGrayRef.current, w, h, s.motionThreshold, s.sampleRate));
-        if (s.showEdges && !n4t && !surv && !moc) rawPts = rawPts.concat(detectEdges(gray, w, h, s.sampleRate));
+        // Guard: proc resolution changed (resize/rotate) → old gray buffer is invalid
+        if (prevGrayRef.current && prevGrayRef.current.length !== pw * ph) {
+          prevGrayRef.current = null;
+          trackerRef.current = { points: [], nextId: 1 };
+        }
+
+        const cfg = surv ? { maxPoints: s.survPoints, threshold: s.survThreshold, step: s.sampleRate }
+                  : moc  ? { maxPoints: s.mocPoints, threshold: s.mocThreshold, step: s.sampleRate }
+                  : n4t  ? { maxPoints: s.n4tPoints, threshold: s.n4tThreshold, step: s.sampleRate, lumBias: true }
+                  :        { maxPoints: s.skxPoints, threshold: s.motionThreshold, step: s.sampleRate };
+        trackerUpdate(trackerRef.current, prevGrayRef.current, gray, pw, ph, cfg);
         prevGrayRef.current = gray;
 
-        let points;
-        if (surv || moc) {
-          // Frame-to-frame identity: match this frame's candidates to last frame's
-          // tracked points by nearest neighbor, EMA-smooth position, carry velocity.
-          const thr = surv ? s.survThreshold : s.mocThreshold;
-          const maxP = surv ? s.survPoints : s.mocPoints;
-          let raw = detectMotion(gray, prevGrayRef.current === gray ? null : prevGrayRef.current, w, h, thr, s.sampleRate);
-          raw = raw.concat(detectEdges(gray, w, h, s.sampleRate, thr * 2.2));
-          const fresh = thinPoints(raw, maxP);
-          const prev = surv ? survPrevRef.current : mocPrevRef.current;
-          const matchR = Math.min(w, h) * 0.07;
-          const ema = 0.55;
-          const used = new Set();
-          const out = [];
-          for (let i = 0; i < fresh.length; i++) {
-            const p = fresh[i];
-            let bi = -1, bd = matchR;
-            for (let j = 0; j < prev.length; j++) {
-              if (used.has(j)) continue;
-              const d = Math.hypot(prev[j].x - p.x, prev[j].y - p.y);
-              if (d < bd) { bd = d; bi = j; }
-            }
-            if (bi >= 0) {
-              const q = prev[bi];
-              used.add(bi);
-              const nx = q.x + (p.x - q.x) * ema;
-              const ny = q.y + (p.y - q.y) * ema;
-              const vx = nx - q.x, vy = ny - q.y;
-              out.push({ x: nx, y: ny, vx, vy, intensity: p.intensity, idx: q.idx ?? i, age: (q.age || 0) + 1 });
-            } else {
-              out.push({ x: p.x, y: p.y, vx: 0, vy: 0, intensity: p.intensity, idx: out.length, age: 0 });
-            }
-          }
-          // Reassign compact IDs based on age (oldest first) for stable label numbering
-          out.sort((a, b) => (b.age - a.age) || (b.intensity - a.intensity));
-          for (let i = 0; i < out.length; i++) out[i].idx = i;
-          points = out;
-          if (surv) survPrevRef.current = out;
-          else mocPrevRef.current = out;
-        } else if (n4t) {
-          // Same pipeline as Skeletrix: motion + edges → thinPoints.
-          // Luminance weight biases the intensity sort toward bright subjects
-          // (white flowers, water glints) so they win over dark leaf texture.
-          let rawPts = detectMotion(gray, prevGrayRef.current, w, h, s.n4tThreshold, s.sampleRate);
-          rawPts = rawPts.concat(detectEdges(gray, w, h, s.sampleRate, s.n4tThreshold * 2));
-          for (const pt of rawPts) {
-            const lum = gray[Math.round(pt.y) * w + Math.round(pt.x)] / 255;
-            pt.intensity *= (0.25 + 0.75 * lum * lum);
-          }
-          n4tBufferRef.current.push(rawPts);
-          if (n4tBufferRef.current.length > s.n4tSmooth) n4tBufferRef.current.shift();
-          const pooled = n4tBufferRef.current.flat();
-          points = thinPoints(pooled, s.n4tPoints).map((p, i) => ({ ...p, idx: i }));
-        } else {
-          points = thinPoints(rawPts, skx ? s.skxPoints : s.maxPoints).map((p,i) => ({ ...p, idx: i }));
-        }
-        const tris = points.length >= 3 ? delaunay(points) : [];
+        // Oldest (most stable) points first so labels/ids stay consistent
+        const ranked = [...trackerRef.current.points].sort((a, b) => (b.age - a.age) || (b.intensity - a.intensity));
+        const points = ranked.map((p, i) => ({
+          x: p.x * scale, y: p.y * scale,
+          vx: p.vx * scale, vy: p.vy * scale,
+          intensity: p.intensity, idx: i, age: p.age,
+        }));
+
+        const tris = !surv && points.length >= 3 ? delaunay(points) : [];
         setPointCount(points.length); setTriCount(tris.length);
 
-        if (skx) {
-          renderSkeletrix(overlayCtx, points, tris, s, col, w, h, frame.data);
-        } else if (n4t) {
-          renderN4ture(overlayCtx, points, tris, s, w, h, frame.data);
-        } else if (surv) {
-          renderSurveil(overlayCtx, points, s, w, h, frame.data, (time - sessionStartRef.current)/1000);
-        } else if (moc) {
-          renderMocap(overlayCtx, points, tris, s, w, h, frame.data);
-        } else {
-          trailRef.current.push(points);
-          if (trailRef.current.length > s.trailLength) trailRef.current.shift();
-          renderDelaunay(overlayCtx, points, tris, trailRef.current, s, col, w, h);
-        }
+        if (skx) renderSkeletrix(overlayCtx, points, tris, s, col, w, h, frame);
+        else if (n4t) renderN4ture(overlayCtx, points, tris, s, w, h, frame);
+        else if (surv) renderSurveil(overlayCtx, points, s, w, h, frame, (time - sessionStartRef.current)/1000);
+        else renderMocap(overlayCtx, points, tris, s, w, h, frame);
       } else {
         ctx.fillStyle = "#0a0a0a"; ctx.fillRect(0,0,w,h);
         overlayCtx.clearRect(0,0,w,h);
@@ -1156,9 +1029,9 @@ export default function Tracer() {
 
   const startWebcam = useCallback(async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:1920}, height:{ideal:1080} }, audio:false });
+      const stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ideal:"environment"}, width:{ideal:1280}, height:{ideal:720} }, audio:false });
       const v = videoRef.current; v.srcObject=stream; v.muted=true; await v.play();
-      prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[]; n4tTrackedRef.current=[]; survPrevRef.current=[]; mocPrevRef.current=[]; sessionStartRef.current=performance.now();
+      prevGrayRef.current=null; trackerRef.current={points:[],nextId:1}; sessionStartRef.current=performance.now();
       if (v.videoWidth && v.videoHeight) { videoAspectRef.current = v.videoWidth / v.videoHeight; if (resizeFnRef.current) resizeFnRef.current(); }
       setSource("webcam"); setVideoName("Webcam");
     } catch(e) { console.error("Webcam error:", e); }
@@ -1170,7 +1043,7 @@ export default function Tracer() {
     const v = videoRef.current;
     if (v.srcObject) { v.srcObject.getTracks().forEach(t=>t.stop()); v.srcObject=null; }
     v.muted=true; v.playsInline=true; v.loop=true; v.preload="auto"; v.src=url;
-    prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[]; n4tTrackedRef.current=[]; survPrevRef.current=[]; mocPrevRef.current=[]; sessionStartRef.current=performance.now(); setVideoName(file.name);
+    prevGrayRef.current=null; trackerRef.current={points:[],nextId:1}; sessionStartRef.current=performance.now(); setVideoName(file.name);
     const onReady = () => {
       v.removeEventListener("canplay",onReady); v.removeEventListener("loadeddata",onReady);
       if (v.videoWidth && v.videoHeight) {
@@ -1188,7 +1061,7 @@ export default function Tracer() {
     const v = videoRef.current;
     if (v.srcObject) { v.srcObject.getTracks().forEach(t=>t.stop()); v.srcObject=null; }
     if (v.src) { v.pause(); v.removeAttribute("src"); v.load(); }
-    prevGrayRef.current=null; trailRef.current=[]; n4tBufferRef.current=[]; n4tTrackedRef.current=[]; survPrevRef.current=[]; mocPrevRef.current=[]; sessionStartRef.current=performance.now();
+    prevGrayRef.current=null; trackerRef.current={points:[],nextId:1}; sessionStartRef.current=performance.now();
     videoAspectRef.current = null; if (resizeFnRef.current) resizeFnRef.current();
     setSource("idle"); setVideoName("");
   }, []);
@@ -1230,12 +1103,12 @@ export default function Tracer() {
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"12px 20px", borderBottom:"1px solid #1a1a1a", flexShrink:0, zIndex:10 }}>
         <div style={{ display:"flex", alignItems:"center", gap:12 }}>
           <span style={{ fontSize:18, fontWeight:700, letterSpacing:6, color:colors.primary, textShadow:`0 0 20px ${colors.glow}` }}>TRACER</span>
-          <span style={{ fontSize:9, color:"#555", letterSpacing:2, paddingTop:2 }}>v1.2</span>
+          <span style={{ fontSize:9, color:"#555", letterSpacing:2, paddingTop:2 }}>v1.3</span>
         </div>
         <div style={{ display:"flex", alignItems:"center", gap:16, fontSize:10, color:"#555" }}>
-          <span style={{ color: isSkx ? "#ff44ff" : isN4t ? "#44ffaa" : isSurv ? "#ff3838" : isMoc ? "#ff00cc" : colors.primary, opacity: 0.7 }}>{isSkx ? "SKX" : isN4t ? "N4T" : isSurv ? "SRV" : isMoc ? "MOC" : "DLN"}</span>
-          <span>{pointCount} PTS</span>
-          <span>{triCount} TRI</span>
+          <span style={{ color: isSkx ? "#ff44ff" : isN4t ? "#44ffaa" : isSurv ? "#ff3838" : "#ff00cc", opacity: 0.7 }}>{isSkx ? "SKX" : isN4t ? "N4T" : isSurv ? "SRV" : "MOC"}</span>
+          {!isMobile && <span>{pointCount} PTS</span>}
+          {!isMobile && <span>{triCount} TRI</span>}
           <span>{fps} FPS</span>
           <span style={{ color: loading?"#ffbf00":source==="idle"?"#555":colors.primary }}>
             {loading?"⟳ LOADING…":source==="idle"?"STANDBY":source==="webcam"?"● LIVE":`▶ ${videoName}`}
@@ -1270,13 +1143,18 @@ export default function Tracer() {
 
         {/* Sidebar */}
         {sidebarOpen && (
-          <div style={{ width:260, background:"#0d0d0d", borderLeft:"1px solid #1a1a1a", padding:"16px 16px 80px", overflowY:"auto", flexShrink:0, scrollbarWidth:"thin", scrollbarColor:"#333 transparent" }}>
+          <div style={{
+            ...(isMobile
+              ? { position:"absolute", top:0, right:0, bottom:0, width:"min(280px, 82vw)", zIndex:20, boxShadow:"-8px 0 30px rgba(0,0,0,0.65)", borderLeft:"1px solid #1a1a1a" }
+              : { width:260, flexShrink:0, borderLeft:"1px solid #1a1a1a" }),
+            background:"#0d0d0d", padding:"16px 16px 80px", overflowY:"auto",
+            scrollbarWidth:"thin", scrollbarColor:"#333 transparent", WebkitOverflowScrolling:"touch",
+          }}>
 
             {/* Render mode toggle */}
             <div style={{ fontSize:10, color:"#555", letterSpacing:3, marginBottom:12 }}>RENDER MODE</div>
             <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:6, marginBottom:4 }}>
               {[
-                ["delaunay","DELAUNAY", colors.primary, colors.glow],
                 ["skeletrix","SKELETRIX", "#ff44ff", "rgba(255,68,255,0.15)"],
                 ["n4ture","N4TURE", "#44ffaa", "rgba(68,255,170,0.15)"],
                 ["surveil","SURVEIL", "#ff3838", "rgba(255,56,56,0.15)"],
@@ -1293,9 +1171,8 @@ export default function Tracer() {
             </div>
 
             <Section title="TRACKING">
-              <Slider label="Motion Sensitivity" value={settings.motionThreshold} min={10} max={100} step={1} onChange={v=>set("motionThreshold",v)} color={colors.primary} />
-              <Slider label="Sample Density" value={settings.sampleRate} min={2} max={12} step={1} onChange={v=>set("sampleRate",v)} color={colors.primary} />
-              <Toggle label="Edge Detection" value={settings.showEdges} onChange={v=>set("showEdges",v)} color={colors.primary} />
+              <Slider label="Motion Sensitivity" value={settings.motionThreshold} min={4} max={60} step={1} onChange={v=>set("motionThreshold",v)} color={colors.primary} />
+              <Slider label="Sample Density" value={settings.sampleRate} min={2} max={8} step={1} onChange={v=>set("sampleRate",v)} color={colors.primary} />
             </Section>
 
             {/* Mode-specific controls */}
@@ -1312,7 +1189,6 @@ export default function Tracer() {
               <Section title="N4TURE">
                 <Slider label="Track Points" value={settings.n4tPoints} min={8} max={60} step={1} onChange={v=>set("n4tPoints",v)} color="#44ffaa" />
                 <Slider label="Sensitivity" value={settings.n4tThreshold} min={5} max={50} step={1} onChange={v=>set("n4tThreshold",v)} color="#44ffaa" />
-                <Slider label="Smooth Frames" value={settings.n4tSmooth} min={1} max={10} step={1} onChange={v=>set("n4tSmooth",v)} color="#44ffaa" />
                 <Slider label="Organic Radius" value={settings.n4tOrganicRadius} min={4} max={20} step={1} onChange={v=>set("n4tOrganicRadius",v)} color="#44ffaa" />
                 <Toggle label="Flow Lines" value={settings.n4tFlowLines} onChange={v=>set("n4tFlowLines",v)} color="#44ffaa" />
                 <Toggle label="Swatches" value={settings.n4tSwatches} onChange={v=>set("n4tSwatches",v)} color="#44ffaa" />
@@ -1331,7 +1207,7 @@ export default function Tracer() {
                 <Toggle label="Pixel Mosaic" value={settings.survPixelate} onChange={v=>set("survPixelate",v)} color="#ff3838" />
                 <Slider label="Line Weight" value={settings.survLineWeight} min={0.3} max={5} step={0.1} onChange={v=>set("survLineWeight",v)} color="#ff3838" />
               </Section>
-            ) : isMoc ? (
+            ) : (
               <Section title="MOCAP">
                 <Slider label="Nodes" value={settings.mocPoints} min={8} max={120} step={1} onChange={v=>set("mocPoints",v)} color="#ff00cc" />
                 <Slider label="Sensitivity" value={settings.mocThreshold} min={5} max={50} step={1} onChange={v=>set("mocThreshold",v)} color="#ff00cc" />
@@ -1343,26 +1219,6 @@ export default function Tracer() {
                 <Toggle label="RGB Sampling" value={settings.mocRgb} onChange={v=>set("mocRgb",v)} color="#ff00cc" />
                 <Slider label="Line Weight" value={settings.mocLineWeight} min={0.3} max={5} step={0.1} onChange={v=>set("mocLineWeight",v)} color="#ff00cc" />
               </Section>
-            ) : (
-              <>
-                <Section title="TRIANGULATION">
-                  <Slider label="Max Points" value={settings.maxPoints} min={30} max={300} step={10} onChange={v=>set("maxPoints",v)} color={colors.primary} />
-                  <Toggle label="Mesh" value={settings.showMesh} onChange={v=>set("showMesh",v)} color={colors.primary} />
-                  <Slider label="Triangle Fill" value={settings.triangleFill} min={0} max={0.2} step={0.01} onChange={v=>set("triangleFill",v)} color={colors.primary} />
-                  <Toggle label="Points" value={settings.showPoints} onChange={v=>set("showPoints",v)} color={colors.primary} />
-                  <Toggle label="Trails" value={settings.showTrails} onChange={v=>set("showTrails",v)} color={colors.primary} />
-                  <Toggle label="Coordinates" value={settings.showLabels} onChange={v=>set("showLabels",v)} color={colors.primary} />
-                </Section>
-                <Section title="STYLE">
-                  <Slider label="Point Size" value={settings.pointSize} min={1} max={6} step={0.5} onChange={v=>set("pointSize",v)} color={colors.primary} />
-                  <Slider label="Line Weight" value={settings.lineWeight} min={0.3} max={3} step={0.1} onChange={v=>set("lineWeight",v)} color={colors.primary} />
-                  <Slider label="Glow Intensity" value={settings.glowIntensity} min={0} max={30} step={1} onChange={v=>set("glowIntensity",v)} color={colors.primary} />
-                </Section>
-                <Section title="TRAILS">
-                  <Slider label="Trail Length" value={settings.trailLength} min={2} max={80} step={1} onChange={v=>set("trailLength",v)} color={colors.primary} />
-                  <Slider label="Trail Decay" value={settings.trailDecay} min={0.8} max={0.99} step={0.01} onChange={v=>set("trailDecay",v)} color={colors.primary} />
-                </Section>
-              </>
             )}
 
             <Section title="DISPLAY">
